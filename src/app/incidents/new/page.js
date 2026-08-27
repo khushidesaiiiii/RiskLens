@@ -1,4 +1,42 @@
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+
+import { createIncident } from "@/lib/incidents";
+
 export default function NewIncidentPage() {
+    const router = useRouter();
+
+    const [title, setTitle] = useState("");
+    const [description, setDescription] = useState("");
+    const [location, setLocation] = useState("");
+    const [severity, setSeverity] = useState("LOW");
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [error, setError] = useState(null);
+
+    async function handleSubmit(event) {
+        event.preventDefault();
+
+        setIsSubmitting(true);
+        setError(null);
+
+        try {
+            const incident = await createIncident({
+                title,
+                description,
+                location,
+                severity,
+            });
+
+            router.push(`/incidents/${incident.id}`);
+        } catch (err) {
+            console.error("Failed to create incident:", err);
+            setError(err.message);
+            setIsSubmitting(false);
+        }
+    }
+
     return (
         <main className="min-h-screen bg-gray-50 p-8">
             <div className="mx-auto max-w-3xl">
@@ -12,7 +50,16 @@ export default function NewIncidentPage() {
                     </p>
                 </div>
 
-                <form className="mt-8 space-y-6 rounded-xl border bg-white p-8 shadow-sm">
+                {error && (
+                    <div className="mt-6 rounded-lg border border-red-300 bg-red-50 p-4 text-red-700">
+                        {error}
+                    </div>
+                )}
+
+                <form
+                    onSubmit={handleSubmit}
+                    className="mt-8 space-y-6 rounded-xl border bg-white p-8 shadow-sm"
+                >
                     <div>
                         <label className="block text-sm font-medium text-gray-700">
                             Incident title
@@ -20,6 +67,9 @@ export default function NewIncidentPage() {
 
                         <input
                             type="text"
+                            required
+                            value={title}
+                            onChange={(event) => setTitle(event.target.value)}
                             placeholder="e.g. Forklift collision"
                             className="mt-2 w-full rounded-lg border px-4 py-3 outline-none focus:ring-2 focus:ring-black"
                         />
@@ -32,6 +82,9 @@ export default function NewIncidentPage() {
 
                         <textarea
                             rows={6}
+                            required
+                            value={description}
+                            onChange={(event) => setDescription(event.target.value)}
                             placeholder="Describe what happened..."
                             className="mt-2 w-full rounded-lg border px-4 py-3 outline-none focus:ring-2 focus:ring-black"
                         />
@@ -44,6 +97,9 @@ export default function NewIncidentPage() {
 
                         <input
                             type="text"
+                            required
+                            value={location}
+                            onChange={(event) => setLocation(event.target.value)}
                             placeholder="e.g. Warehouse A"
                             className="mt-2 w-full rounded-lg border px-4 py-3 outline-none focus:ring-2 focus:ring-black"
                         />
@@ -54,7 +110,11 @@ export default function NewIncidentPage() {
                             Severity
                         </label>
 
-                        <select className="mt-2 w-full rounded-lg border px-4 py-3">
+                        <select
+                            value={severity}
+                            onChange={(event) => setSeverity(event.target.value)}
+                            className="mt-2 w-full rounded-lg border px-4 py-3"
+                        >
                             <option value="LOW">Low</option>
                             <option value="MEDIUM">Medium</option>
                             <option value="HIGH">High</option>
@@ -64,9 +124,10 @@ export default function NewIncidentPage() {
 
                     <button
                         type="submit"
-                        className="w-full rounded-lg bg-black px-5 py-3 font-medium text-white hover:bg-gray-800"
+                        disabled={isSubmitting}
+                        className="w-full rounded-lg bg-black px-5 py-3 font-medium text-white hover:bg-gray-800 disabled:opacity-50"
                     >
-                        Submit Incident
+                        {isSubmitting ? "Submitting..." : "Submit Incident"}
                     </button>
                 </form>
             </div>
