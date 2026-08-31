@@ -1,23 +1,47 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-
-import { configureAmplify } from "@/lib/amplify";
 
 import {
     login,
     getAuthSession,
+    getAuthenticatedUser,
 } from "@/lib/auth";
 
 export default function LoginPage() {
-    configureAmplify();
     const router = useRouter();
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
 
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
+
+    useEffect(() => {
+        let cancelled = false;
+
+        async function checkExistingSession() {
+            try {
+                const session = await getAuthSession();
+
+                if (
+                    !cancelled &&
+                    session.tokens?.accessToken
+                ) {
+                    router.replace("/incidents");
+                }
+            } catch {
+                // No authenticated session.
+                // Stay on the login page.
+            }
+        }
+
+        checkExistingSession();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [router]);
 
     async function handleSubmit(event) {
         event.preventDefault();
@@ -28,13 +52,11 @@ export default function LoginPage() {
         try {
             const result = await login(email, password);
 
-            console.log("Cognito sign-in result:", result);
+            if (!result?.isSignedIn) {
+                throw new Error("Additional authentication is required.");
+            }
 
-            const session = await getAuthSession();
-
-            console.log("Auth session:", session);
-
-            router.push("/incidents");
+            router.replace("/incidents");
         } catch (error) {
             console.error("Login failed:", error);
 

@@ -1,5 +1,6 @@
+import { getAuthSession } from "@/lib/auth";
+
 const APPSYNC_URL = process.env.NEXT_PUBLIC_APPSYNC_URL;
-const APPSYNC_API_KEY = process.env.NEXT_PUBLIC_APPSYNC_API_KEY;
 
 function assertConfigured() {
     if (!APPSYNC_URL) {
@@ -7,16 +8,34 @@ function assertConfigured() {
             "Missing NEXT_PUBLIC_APPSYNC_URL environment variable. Set it in .env.local to your AppSync GraphQL endpoint URL."
         );
     }
+}
 
-    if (!APPSYNC_API_KEY) {
+async function getIdToken() {
+    let session;
+
+    try {
+        session = await getAuthSession();
+    } catch (sessionError) {
+        console.error("AppSync auth session error:", sessionError);
+
         throw new Error(
-            "Missing NEXT_PUBLIC_APPSYNC_API_KEY environment variable. Set it in .env.local to a valid AppSync API key."
+            "Unable to read the Cognito auth session. Make sure Amplify is configured."
         );
     }
+
+    const idToken = session?.tokens?.idToken?.toString();
+
+    if (!idToken) {
+        throw new Error("No authenticated Cognito session found");
+    }
+
+    return idToken;
 }
 
 export async function executeGraphQL(query, variables = {}) {
     assertConfigured();
+
+    const idToken = await getIdToken();
 
     let response;
 
@@ -26,7 +45,7 @@ export async function executeGraphQL(query, variables = {}) {
 
             headers: {
                 "Content-Type": "application/json",
-                "x-api-key": APPSYNC_API_KEY,
+                Authorization: idToken,
             },
 
             body: JSON.stringify({
