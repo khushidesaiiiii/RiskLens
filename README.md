@@ -35,6 +35,11 @@ Status: Complete
 
 Phase 2 — Cognito Authentication
 Status: Complete
+
+Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management
+Status: Local implementation done — AWS Console changes + data
+        migration required before this phase is live (see
+        Multi-Tenancy below)
 ```
 
 The original 10-phase roadmap scoped "AppSync + GraphQL API layer" and
@@ -301,16 +306,17 @@ current (unresolved by Phase 2) — see [Future Risks](#future-risks).
 Table: RiskLens
 Partition Key (pk): string
 Sort Key (sk): string
-GSI: GSI1 (GSI1PK / GSI1SK)
+GSI1: GSI1PK / GSI1SK   — legacy, pre-multi-tenancy incident listing
+GSI2: GSI2PK / GSI2SK   — Phase 2.2, Cognito user -> organization lookup
 ```
 
-This design lives entirely behind AppSync now. The application code
-does **not** assume a plain `id` partition key, and does not construct
-`pk`, `sk`, `GSI1PK`, or `GSI1SK` anywhere — those are backend
-persistence details owned by the AppSync resolvers.
+This design lives entirely behind AppSync. The application code does
+**not** assume a plain `id` partition key, and does not construct `pk`,
+`sk`, or any GSI key anywhere — those are backend persistence details
+owned by the AppSync resolvers.
 
-**Access patterns confirmed working via the AppSync API (verified
-manually in the AppSync console and via this migration):**
+**Phase 1/2 shape (pre-multi-tenancy — still the live shape until the
+Phase 2.2 migration below is actually run):**
 
 ```text
 pk                    sk          Used by (via AppSync resolver)
@@ -322,31 +328,322 @@ GSI1PK                GSI1SK                       Used by
 INCIDENTS              CREATED#<timestamp>#<id>    incidents(limit, nextToken)
 ```
 
-`incidents(limit, nextToken)` is backed by a `GSI1` query (not a table
-scan), and supports cursor-based pagination via `nextToken` — the
-Next.js list page and service layer already integrate with this (see
-[Current Status](#current-status)).
-
-**Planned / future entity key strategy** (conceptual — not yet
-implemented, no additional attributes or indexes should be assumed):
+**Phase 2.2 target shape (multi-tenancy — designed and documented here;
+requires the AWS Console changes and migration script in
+[Multi-Tenancy](#multi-tenancy-phase-22) before it's the live shape):**
 
 ```text
-pk                    sk
-────────────────────────────────────
-INCIDENT#123          METADATA
-INCIDENT#123          ANALYSIS
-INCIDENT#123          ACTION#001
-INCIDENT#123          ATTACHMENT#001
+pk                    sk                  Used by
+────────────────────────────────────────────────────────────────
+ORG#<orgId>           METADATA            myOrganization
+ORG#<orgId>           USER#<cognitoSub>   myOrganization (via GSI2), future membership listing
+ORG#<orgId>           INCIDENT#<id>       incidents, incident(id), createIncident
 
-USER#456              PROFILE
-
-ORG#789               METADATA
-ORG#789               USER#456
+GSI2PK                 GSI2SK              Used by
+────────────────────────────────────────────────────────────────
+USER#<cognitoSub>      ORG#<orgId>         resolveCallerOrganization (reverse lookup: given a
+                                            Cognito user, find their organization membership)
 ```
+
+Once the Phase 2.2 migration runs, `GSI1` becomes unused (nothing
+deletes it automatically — cleaning it up is optional later work) and
+`incidents(limit, nextToken)` queries the caller's own `ORG#<orgId>`
+partition directly instead of one shared `INCIDENTS` bucket — a
+scalability improvement noted as a Future Risk in earlier phases,
+resolved as a side effect of adding tenancy.
 
 Do not create additional DynamoDB tables per entity — this project uses
 single-table design on the existing `RiskLens` table, and do not change
-`pk`/`sk`/`GSI1` without an explicit, documented reason.
+`pk`/`sk`/`GSI1`/`GSI2` without an explicit, documented reason.
+
+---
+
+## Multi-Tenancy (Phase 2.2)
+
+```text
+Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management
+Status: Local implementation done. AWS Console changes + data migration
+        NOT yet applied — this phase is not live until you complete the
+        steps below.
+```
+
+### Architecture
+
+```text
+Cognito User (identity — ctx.identity.sub, never trusted from the client)
+    ↓
+OrganizationMembership (DynamoDB — pk=ORG#<orgId>, sk=USER#<sub>, role)
+    ↓
+Organization (DynamoDB — pk=ORG#<orgId>, sk=METADATA)
+    ↓
+Incidents (DynamoDB — pk=ORG#<orgId>, sk=INCIDENT#<id>)
+```
+
+**The frontend never supplies an organizationId, anywhere.** Every
+organization-scoped GraphQL operation (`myOrganization`, `incidents`,
+`incident`, `createIncident`) determines the caller's organization
+entirely from their Cognito identity, server-side, in the resolver — the
+GraphQL argument shapes for `incidents`/`incident`/`createIncident` are
+**unchanged** from Phase 1.
+
+### What's implemented locally (verified by lint/build, not yet live)
+
+- `src/graphql/queries/organization.js` — `GetMyOrganization` query
+  (no arguments).
+- `src/lib/organization.js` — `getMyOrganization()`, returns
+  `{ organization: { id, name, createdAt, updatedAt }, role }` or
+  `null` if the caller has no organization membership. Follows the
+  same service-layer pattern as `src/lib/incidents.js` — no GraphQL
+  strings or AWS details above this layer.
+- `src/app/(app)/layout.js` — after confirming a Cognito session, loads
+  the caller's organization and shows its name in the header. Added two
+  new states: **no-organization** (clear message + sign-out, for a
+  Cognito user with no membership row yet) and
+  **organization-error** (network/GraphQL failure loading the org,
+  distinct from a session failure).
+- `/incidents`, `/incidents/new`, `/incidents/[id]` — **unchanged**.
+  Tenant scoping happens entirely in the resolver; these pages already
+  only call `src/lib/incidents.js`, so there was nothing for them to do
+  differently.
+- `infrastructure/appsync/` — the exact schema SDL and AppSync JS
+  resolver code to paste into AWS Console (see below). Not deployed by
+  this repo — there is no infrastructure-as-code wired up for this
+  AppSync API.
+- `scripts/migrate-incidents-to-organizations.mjs` — dry-run-by-default,
+  idempotent migration script. **Not executed** — it writes to the real
+  DynamoDB table, so it's handed over for you to run deliberately (see
+  [Migration](#migration) below).
+- `src/graphql/mutations/createOrganization.js`,
+  `src/lib/organization.js` (`createOrganization(name)`) — lets an
+  authenticated user with no organization create one. The client only
+  ever sends `name`; `id`, the creator's `OWNER` membership, and the
+  GSI2 attributes are all generated server-side (see
+  [Organization Creation](#organization-creation) below).
+- `src/app/(app)/layout.js` — the **no-organization** state is now a
+  real form (name input, Create button, loading/validation/GraphQL
+  error states) instead of a dead end. On success it updates the header
+  immediately and redirects to `/incidents`.
+
+### Tenant isolation design
+
+- **Membership, not a client-supplied id, decides access.** Every
+  resolver runs a shared pipeline step
+  (`resolveCallerOrganization.function.js`) that looks up the caller's
+  `OrganizationMembership` via `ctx.identity.sub` (the Cognito user's
+  stable identifier — never email, never anything from the request
+  payload).
+- **Cross-tenant reads fail by construction.** `incident(id)` always
+  does `GetItem({pk: ORG#<callerOrg>, sk: INCIDENT#<id>})`. An incident
+  in a different organization simply isn't at that key — DynamoDB
+  returns nothing, and the caller gets the same "not found" as a
+  nonexistent id. This is deliberate: it never confirms or denies that
+  an id exists in someone else's organization.
+- **No membership → no data, clearly.** `myOrganization` returns `null`
+  (not an error) so the UI can show a specific message.
+  `incidents`/`incident`/`createIncident` raise a specific
+  `NoOrganizationMembership` error rather than silently returning empty
+  results.
+- Roles (`OWNER`/`ADMIN`/`MEMBER`) are stored on the membership record
+  and returned by `myOrganization`, but nothing currently branches on
+  role — no RBAC beyond membership-implies-access is implemented yet,
+  per the original design ("do not implement complex RBAC yet unless
+  required").
+
+### AWS Console steps required
+
+**Nothing above is live yet.** These are the exact manual steps —
+none of them can be performed from this repository.
+
+1. **DynamoDB → add GSI2** (RiskLens table → Indexes → Create index)
+   - Partition key: `GSI2PK` (String)
+   - Sort key: `GSI2SK` (String)
+   - Projection: All attributes (simplest; the membership item is small)
+   - **Why:** membership items are keyed `pk=ORG#<orgId>/sk=USER#<sub>`,
+     which only supports "list members of an org I already know." There
+     is no way to answer "which org is this Cognito user in" without
+     either this reverse index or a second table (which is explicitly
+     out of scope) — GSI2 is genuinely required, not optional.
+   - **Verify:** after creating it, `aws dynamodb describe-table
+     --table-name RiskLens` (or the Console's Indexes tab) shows `GSI2`
+     as `ACTIVE`.
+
+2. **AppSync → Schema → add types + field.** Open
+   `infrastructure/appsync/schema-organizations.graphql` in this repo
+   and paste its contents in: add `Organization`, `OrganizationMembership`,
+   and `MyOrganizationMembership` as new top-level types, and add
+   `myOrganization: MyOrganizationMembership` as a new field inside your
+   *existing* `type Query { ... }` block (don't create a second `Query`
+   type). Save.
+   - **Why:** these types don't exist yet — confirmed via a live
+     introspection query against the current API before writing any of
+     this.
+   - **Verify:** the schema saves without errors, and a fresh
+     introspection query shows `Query.myOrganization` and the three new
+     types.
+
+3. **AppSync → Functions → create `resolveCallerOrganization`.** Runtime:
+   **APPSYNC_JS**. Data source: the existing DynamoDB data source for
+   the RiskLens table. Paste the code from
+   `infrastructure/appsync/resolvers/resolveCallerOrganization.function.js`.
+   - **Why:** this is the one place the "look up the caller's org from
+     their Cognito identity" logic lives, shared as a pipeline step by
+     all four operations below — avoids writing the same lookup four
+     times.
+   - **Verify:** the Function saves with no syntax errors reported by
+     the console.
+
+4. **AppSync → Schema → attach/replace resolvers, runtime APPSYNC_JS,
+   each as a pipeline resolver with `resolveCallerOrganization` as step 1
+   and the file below as step 2:**
+   - `Query.myOrganization` (new) → `infrastructure/appsync/resolvers/Query.myOrganization.js`
+   - `Query.incidents` (replace existing) → `infrastructure/appsync/resolvers/Query.incidents.js`
+   - `Query.incident` (replace existing) → `infrastructure/appsync/resolvers/Query.incident.js`
+   - `Mutation.createIncident` (replace existing) → `infrastructure/appsync/resolvers/Mutation.createIncident.js`
+   - **Why:** these are the resolvers that actually enforce the tenant
+     boundary — without this step, the schema/GSI changes above do
+     nothing.
+   - **Verify:** run the introspection/`curl` checks in
+     [Manual verification](#manual-verification-still-required) below —
+     don't just trust that the console accepted the paste.
+
+5. **AppSync → Schema → add `createOrganization`.** Paste the
+   `CreateOrganizationInput` input type and the `createOrganization`
+   field (added into your existing `type Mutation { ... }` block) from
+   the same `infrastructure/appsync/schema-organizations.graphql` file
+   used in step 2. Then attach a **new** pipeline resolver on
+   `Mutation.createOrganization`, runtime APPSYNC_JS, with:
+   - Step 1: the **same** `resolveCallerOrganization` Function from
+     step 3 (no new Function needed)
+   - Step 2: `infrastructure/appsync/resolvers/Mutation.createOrganization.js`
+   - **Why:** reusing `resolveCallerOrganization` here isn't just
+     convenience — it's what lets step 2 detect "this caller already has
+     an organization" and refuse to create a second one (this project is
+     one-organization-per-user for now).
+   - **Verify:** see [Organization Creation](#organization-creation)
+     below for the full checklist.
+
+**Not required:** a second DynamoDB table, a second Cognito User Pool,
+API Gateway, or any change to Cognito itself (identity/authentication is
+unchanged — only application-level authorization is new).
+
+### Organization Creation
+
+`createOrganization(input: CreateOrganizationInput!): Organization!` —
+`CreateOrganizationInput` has exactly one field, `name`. There is no
+way for the client to submit `organizationId`, `userId`, `role`, or the
+GSI2 attributes — the schema simply has no fields for them, so this
+isn't just a resolver-side check, it's structurally impossible.
+
+**Flow:**
+1. `resolveCallerOrganization` (pipeline step 1) looks up an existing
+   membership. If one exists, step 2 refuses with
+   `AlreadyHasOrganization` — this keeps the current one-org-per-user
+   design intact (see below) rather than silently creating an orphaned
+   second organization.
+2. The resolver validates `name` (non-empty, ≤100 chars after
+   trimming), generates `organizationId` as `org-<8 random hex chars>`
+   (server-side — the client never generates or supplies it), and
+   determines the creator from `ctx.identity.sub`.
+3. It writes the `Organization` item and the creator's `OWNER`
+   `OrganizationMembership` item (with `GSI2PK`/`GSI2SK` already set)
+   using a single DynamoDB **`TransactWriteItems`** call — both items
+   are written together or neither is. This is genuinely atomic (that's
+   what `TransactWriteItems` guarantees), not an approximation of it.
+4. Returns the new `Organization`.
+
+**Because a user's Cognito identity (`sub`) doesn't change across
+sessions, and membership is a persistent DynamoDB record**, a user who
+creates an organization will resolve back to that same organization on
+every future login automatically — `myOrganization`'s GSI2 lookup finds
+the same membership row every time. No extra "remember my org" logic
+was needed for this.
+
+**One organization per user (for now):** `resolveCallerOrganization`'s
+GSI2 query already takes only the first result (`limit: 1`). Multi-org
+membership and org switching are explicitly **not** built — per
+direction, this keeps Phase 2.2 focused. The data model doesn't block
+adding it later: `OrganizationMembership` is already a many-to-many
+join row (one Cognito user could have multiple `pk=ORG#.../sk=USER#<sub>`
+rows across different orgs), so a future "switch organization" feature
+would mean changing `myOrganization` to accept an org id and list all
+of a user's memberships, rather than reshaping the stored data.
+
+**Verification checklist (do this after completing step 5 above):**
+1. In AppSync Console, use the query editor (or "Run a Query" test
+   tool) to call `createOrganization(input: { name: "Test Org" })` as
+   an authenticated Cognito user with no existing membership. It should
+   return an `Organization` with a generated `id` like `org-xxxxxxxx`.
+2. Call it again as the **same** user — it should fail with
+   `AlreadyHasOrganization`, not create a second organization.
+3. In DynamoDB Console, check the RiskLens table for
+   `pk=ORG#<the-new-id>, sk=METADATA` — confirm `name`, `createdAt`,
+   `updatedAt` are present.
+4. Check for `pk=ORG#<the-new-id>, sk=USER#<your-sub>` — confirm
+   `role=OWNER`, `organizationId` matches, and `GSI2PK=USER#<your-sub>`
+   / `GSI2SK=ORG#<the-new-id>` are both present.
+5. Query GSI2 directly (DynamoDB Console → Indexes → GSI2 → Query,
+   `GSI2PK = USER#<your-sub>`) and confirm it returns that membership
+   item.
+6. Call `myOrganization` as that user — confirm it returns the same
+   `id`, `name`, and `role: "OWNER"`.
+7. In the app: sign in as a user with no org → confirm the create-org
+   form appears → submit a name → confirm redirect to `/incidents` and
+   the header shows the new organization's name → sign out, sign back
+   in → confirm the same organization loads again (no re-prompt).
+
+None of this has been run yet — it requires the AWS Console changes
+above first, and I have no way to create a real Cognito-authenticated
+GraphQL request myself (no test user credentials, no IAM permission to
+mint one).
+
+### Migration
+
+Existing Incident records are in the OLD shape
+(`pk=INCIDENT#<id>/sk=METADATA`) and will keep working as read/write
+targets for the OLD resolvers right up until step 4 above is applied —
+after that, the new resolvers only look under `ORG#<orgId>` partitions,
+so old-shape items become invisible to the app until migrated.
+
+Run `scripts/migrate-incidents-to-organizations.mjs` (see the header
+comment in that file for exact commands). It is a **dry run by default**
+— it prints its plan and writes nothing until you pass `--execute`, and
+even then it never deletes the old items unless you also pass
+`--delete-old`. It is idempotent — safe to run repeatedly, since every
+write is conditioned on the target not already existing.
+
+Recommended order:
+1. Run without `--execute` first and read the plan output.
+2. Run with `--execute` (no `--delete-old`) — this copies the
+   Organization, Membership, and Incident items forward, leaving the old
+   Incident items in place as a safety net.
+3. Manually verify in the app (or via `curl`) that the new items look
+   right.
+4. Only then, run with `--execute --delete-old` to remove the old-shape
+   Incident items and eliminate the duplicate source of truth.
+
+This was **not run** as part of this implementation — it writes to your
+real DynamoDB table and needs your Cognito test user's `sub` value,
+which isn't something to fabricate or read without your involvement.
+
+### Manual verification still required
+
+Once you've completed the AWS Console steps and the migration, verify:
+
+1. Sign in → the header shows your organization's name (not blank, not
+   an error).
+2. `/incidents` shows only that organization's incidents.
+3. Load More pagination still works.
+4. `/incidents/new` creates an incident, and it appears in the list
+   without an editable organization field anywhere in the form.
+5. `/incidents/[id]` opens an incident you just created.
+6. A user with no membership row sees the create-organization form, not
+   a raw error or an empty incident list — see
+   [Organization Creation](#organization-creation) for its own, more
+   detailed checklist.
+7. Sign out still works, and protected routes require login again.
+
+None of this has been verified end-to-end yet — the resolver/schema
+changes require the manual AWS Console steps above first.
 
 ---
 
@@ -436,12 +733,20 @@ risklens/
 │   │   ├── client/appsync.js            # executeGraphQL() — Cognito auth + error handling
 │   │   ├── queries/incidents.js         # GET_INCIDENTS
 │   │   ├── queries/incident.js          # GET_INCIDENT
-│   │   └── mutations/createIncident.js  # CREATE_INCIDENT
+│   │   ├── queries/organization.js      # GET_MY_ORGANIZATION (Phase 2.2)
+│   │   ├── mutations/createIncident.js  # CREATE_INCIDENT
+│   │   └── mutations/createOrganization.js  # CREATE_ORGANIZATION (Phase 2.2)
 │   └── lib/
 │       ├── amplify.js                   # configureAmplify()
 │       ├── auth.js                      # login/logout/getAuthenticatedUser/getAuthSession
 │       ├── incidents.js                 # service layer: getIncidents/getIncident/createIncident
+│       ├── organization.js              # service layer: getMyOrganization/createOrganization (Phase 2.2)
 │       └── utils/                       # empty
+├── infrastructure/appsync/              # Phase 2.2 — reference only, not deployed by this repo
+│   ├── schema-organizations.graphql     # SDL to paste into AppSync Console
+│   └── resolvers/                       # AppSync JS resolver code to paste into AppSync Console
+├── scripts/
+│   └── migrate-incidents-to-organizations.mjs  # Phase 2.2 migration — not run automatically
 ├── public/
 ├── .env                                 # local only, gitignored
 ├── .gitignore
@@ -486,7 +791,8 @@ needs it is actually being implemented, not preemptively.
 ```text
 Phase 1 — Foundation & AppSync/GraphQL Incident Integration — ✅ Complete
 Phase 2 — Cognito Authentication — ✅ Complete
-Phase 2.5 — Incident Update/Delete (once AppSync exposes updateIncident/deleteIncident) — ⬅ next up
+Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management — 🔶 Local implementation done, AWS Console + migration pending — ⬅ next up
+Phase 2.5 — Incident Update/Delete (once AppSync exposes updateIncident/deleteIncident)
 Phase 3 — S3 Attachments
 Phase 4 — Bedrock AI Analysis (summarization, risk scoring)
 Phase 5 — RAG / Knowledge Base (policies, procedures, historical incidents)
@@ -503,6 +809,13 @@ shipped as one unit and are now folded into Phase 1.)
 
 ## Known Issues (verified in current code)
 
+- **Phase 2.2 (multi-tenancy) is designed and implemented locally, but
+  not live.** The AppSync schema/resolvers still run the pre-tenancy
+  logic (confirmed via live introspection before this phase started —
+  no `Organization`/`OrganizationMembership` types or `myOrganization`
+  field exist yet), and no incident data has been migrated. See
+  [Multi-Tenancy](#multi-tenancy-phase-22) for the exact AWS Console
+  steps and migration required.
 - **No update/delete:** the deployed AppSync API only exposes
   `createIncident`, `incident`, and `incidents` — there was never an
   edit/delete UI to migrate, and none has been invented. Planned for
@@ -542,13 +855,21 @@ shipped as one unit and are now folded into Phase 1.)
 - **OpenSearch:** introduces an additional stateful service to operate,
   secure, and keep in sync with DynamoDB — plan for eventual consistency
   between the two.
-- **Multi-tenancy:** the current `pk`/`sk`/`GSI1` design has no `ORG#`
-  scoping yet; retrofitting tenant isolation later is more disruptive
-  than designing for it before update/delete lands. Cognito
-  authentication is real now, but it's still one flat user pool with no
-  organization/role concept layered on top — keep Cognito identity
-  (authentication) separate from future organization identity,
-  authorization/roles, and Incident data when that work starts.
+- **Multi-tenancy is now designed (Phase 2.2)** — see
+  [Multi-Tenancy](#multi-tenancy-phase-22) — but until the AWS Console
+  steps and migration are actually applied, this remains a risk, not a
+  resolved concern: don't assume `ORG#` scoping is enforced just because
+  the resolver code has been written.
+- **Update/delete + multi-tenancy interaction:** once `updateIncident`/
+  `deleteIncident` exist (Phase 2.5), they'll need the same
+  `resolveCallerOrganization` pipeline step as `createIncident` — an
+  incident update/delete must be scoped to the caller's org exactly like
+  reads are, not just creates.
+- **Roles are stored but unused:** `OrganizationMembership.role`
+  (OWNER/ADMIN/MEMBER) exists and is returned by `myOrganization`, but
+  no resolver currently branches on it — any member can create
+  incidents in their org. Real RBAC (e.g. only OWNER/ADMIN can do X) is
+  future work, not implemented now.
 - **Update/delete concurrency:** once `updateIncident` exists, decide on
   an optimistic-locking or last-write-wins strategy before shipping it —
   not yet designed.
@@ -560,12 +881,12 @@ shipped as one unit and are now folded into Phase 1.)
 | Dimension | Status | Notes |
 |---|---|---|
 | Architecture | **Needs Work** | Incident read/create flow and Cognito authentication both correctly go through AppSync/GraphQL; Lambda/Bedrock/S3 layers not started |
-| Security | **Needs Work** | Cognito login/logout/session work and AppSync now enforces Cognito User Pool authorization; still no MFA, no server-side (cookie/Middleware) route protection, and no roles/multi-tenancy; no AWS keys or client secrets committed |
-| Repository structure | **Ready** | `src/graphql/` + `src/lib/incidents.js` service-layer pattern is in place and matches the target structure; dead code (old REST route, DynamoDB layer, scratch page) removed |
-| Environment configuration | **Needs Work** | `.env` correctly gitignored; env vars validated with clear errors; no `.env.example` yet for onboarding |
-| AWS integration readiness | **Needs Work** | AppSync/DynamoDB/Cognito integration for Incidents and authentication is working end-to-end; Lambda/Bedrock/S3 not yet integrated |
-| Testing readiness | **Future** | No test framework configured — deliberate choice for this project |
-| Scalability | **Needs Work** | `incidents()` now queries `GSI1` with cursor pagination (no more unscoped scan-like pattern); no `ORG#` tenant scoping yet |
+| Security | **Needs Work** | Cognito login/logout/session work and AppSync enforces Cognito User Pool authorization for the currently-live schema; tenant isolation is designed (Phase 2.2) but not yet deployed; still no MFA, no server-side (cookie/Middleware) route protection, no RBAC |
+| Repository structure | **Ready** | `src/graphql/` + `src/lib/{incidents,organization}.js` service-layer pattern is in place and matches the target structure; `infrastructure/appsync/` now holds the AppSync schema/resolver source-of-truth this project previously lacked |
+| Environment configuration | **Needs Work** | `.env` correctly gitignored; env vars validated with clear errors; no `.env.example` yet for onboarding; no new env vars needed for Phase 2.2 |
+| AWS integration readiness | **Needs Work** | AppSync/DynamoDB/Cognito integration for Incidents and authentication is working end-to-end on the currently-deployed schema; Phase 2.2's schema/resolver/GSI2 changes are written but not deployed; Lambda/Bedrock/S3 not yet integrated |
+| Testing readiness | **Future** | No test framework configured — deliberate choice for this project; Phase 2.2 verification is a manual checklist (see Multi-Tenancy) instead |
+| Scalability | **Needs Work** | Phase 2.2's tenant-scoped `incidents()` query (direct `ORG#<id>` partition query) fixes the old single shared `GSI1` "INCIDENTS" bucket pattern once deployed — not yet live |
 | Maintainability | **Ready** | Clean UI → service layer → GraphQL client → AppSync separation; no GraphQL queries embedded in UI components |
 | Documentation | **Ready** | README/CLAUDE.md/AGENTS.md reflect verified current vs. planned vs. future state as of Phase 1 completion |
 
