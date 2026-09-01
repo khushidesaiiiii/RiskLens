@@ -1,21 +1,27 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
+import Link from "next/link";
 import { getAuthSession, logout } from "@/lib/auth";
-import { createOrganization, getMyOrganization } from "@/lib/organization";
+import { getMyOrganization } from "@/lib/organization";
+import OrganizationOnboardingForm from "@/components/organization/OrganizationOnboardingForm";
+import OrganizationMenu from "@/components/organization/OrganizationMenu";
+import { OrganizationProvider } from "@/components/organization/OrganizationContext";
+
+const NAV_LINKS = [
+    { href: "/dashboard", label: "Dashboard" },
+    { href: "/incidents", label: "Incidents" },
+];
 
 export default function AppLayout({ children }) {
     const router = useRouter();
+    const pathname = usePathname();
 
     const [status, setStatus] = useState("checking");
     const [organization, setOrganization] = useState(null);
     const [orgError, setOrgError] = useState(null);
     const [signingOut, setSigningOut] = useState(false);
-
-    const [orgName, setOrgName] = useState("");
-    const [isCreatingOrg, setIsCreatingOrg] = useState(false);
-    const [createOrgError, setCreateOrgError] = useState(null);
 
     useEffect(() => {
         let cancelled = false;
@@ -90,30 +96,42 @@ export default function AppLayout({ children }) {
         }
     }
 
-    async function handleCreateOrganization(event) {
-        event.preventDefault();
+    // Re-fetches myOrganization() rather than trusting createOrganization's
+    // return value directly — AppSync/DynamoDB stays the single source of
+    // truth for "does this user have an organization now", not the shape
+    // of whichever mutation happened to just run.
+    async function refreshOrganization() {
+        const membership = await getMyOrganization();
 
-        const trimmedName = orgName.trim();
-
-        if (!trimmedName) {
-            setCreateOrgError("Organization name is required.");
-            return;
+        if (!membership) {
+            // Shouldn't happen right after a successful createOrganization,
+            // but never render Dashboard with no organization — stay on
+            // onboarding rather than risk a redirect loop.
+            setStatus("no-organization");
+            return null;
         }
 
-        setIsCreatingOrg(true);
-        setCreateOrgError(null);
+        setOrganization(membership);
+        setStatus("authenticated");
+        return membership;
+    }
+
+    async function handleOrganizationCreated() {
+        setStatus("loading-organization");
 
         try {
-            const created = await createOrganization(trimmedName);
+            const membership = await refreshOrganization();
 
-            setOrganization({ organization: created, role: "OWNER" });
-            setStatus("authenticated");
-            router.replace("/incidents");
+            if (membership) {
+                router.replace("/dashboard");
+            }
         } catch (error) {
-            console.error("Failed to create organization:", error);
-            setCreateOrgError(error.message);
-        } finally {
-            setIsCreatingOrg(false);
+            console.error(
+                "Failed to refresh organization after creation:",
+                error
+            );
+            setOrgError(error.message);
+            setStatus("organization-error");
         }
     }
 
@@ -132,60 +150,16 @@ export default function AppLayout({ children }) {
     if (status === "no-organization") {
         return (
             <main className="flex min-h-screen items-center justify-center bg-gray-50 p-6">
-                <div className="w-full max-w-md rounded-lg border bg-white p-8 shadow-sm">
-                    <h1 className="text-lg font-semibold text-gray-900">
-                        Create your organization
-                    </h1>
-
-                    <p className="mt-2 text-sm text-gray-600">
-                        Your account isn&apos;t a member of any RiskLens
-                        organization yet. Create one to get started —
-                        you&apos;ll be its owner.
-                    </p>
-
-                    {createOrgError && (
-                        <div className="mt-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">
-                            {createOrgError}
-                        </div>
-                    )}
-
-                    <form
-                        onSubmit={handleCreateOrganization}
-                        className="mt-6 space-y-4"
-                    >
-                        <div>
-                            <label
-                                htmlFor="orgName"
-                                className="block text-sm font-medium text-gray-700"
-                            >
-                                Organization name
-                            </label>
-
-                            <input
-                                id="orgName"
-                                type="text"
-                                required
-                                value={orgName}
-                                onChange={(event) => setOrgName(event.target.value)}
-                                placeholder="e.g. RiskLens Development"
-                                className="mt-2 w-full rounded-lg border px-4 py-3 outline-none focus:ring-2 focus:ring-black"
-                            />
-                        </div>
-
-                        <button
-                            type="submit"
-                            disabled={isCreatingOrg}
-                            className="w-full rounded-lg bg-black px-4 py-2 text-sm font-medium text-white hover:bg-gray-800 disabled:opacity-50"
-                        >
-                            {isCreatingOrg ? "Creating..." : "Create Organization"}
-                        </button>
-                    </form>
+                <div className="flex w-full max-w-md flex-col items-center gap-4">
+                    <OrganizationOnboardingForm
+                        onSuccess={handleOrganizationCreated}
+                    />
 
                     <button
                         type="button"
                         onClick={handleSignOut}
                         disabled={signingOut}
-                        className="mt-4 w-full rounded-lg border px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                        className="w-full rounded-lg border bg-white px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
                     >
                         {signingOut ? "Signing out..." : "Sign out"}
                     </button>
@@ -204,45 +178,100 @@ export default function AppLayout({ children }) {
 
                     <p className="mt-2 text-sm text-red-700">{orgError}</p>
 
-                    <button
-                        type="button"
-                        onClick={handleSignOut}
-                        disabled={signingOut}
-                        className="mt-6 rounded-lg border border-red-300 px-4 py-2 text-sm text-red-700 hover:bg-red-100 disabled:opacity-50"
-                    >
-                        {signingOut ? "Signing out..." : "Sign out"}
-                    </button>
+                    <div className="mt-6 flex justify-center gap-3">
+                        <button
+                            type="button"
+                            onClick={async () => {
+                                setStatus("loading-organization");
+
+                                try {
+                                    await refreshOrganization();
+                                } catch (error) {
+                                    console.error(
+                                        "Retry: failed to load organization:",
+                                        error
+                                    );
+                                    setOrgError(error.message);
+                                    setStatus("organization-error");
+                                }
+                            }}
+                            className="rounded-lg border border-red-300 px-4 py-2 text-sm text-red-700 hover:bg-red-100"
+                        >
+                            Retry
+                        </button>
+
+                        <button
+                            type="button"
+                            onClick={handleSignOut}
+                            disabled={signingOut}
+                            className="rounded-lg border border-red-300 px-4 py-2 text-sm text-red-700 hover:bg-red-100 disabled:opacity-50"
+                        >
+                            {signingOut ? "Signing out..." : "Sign out"}
+                        </button>
+                    </div>
                 </div>
             </main>
         );
     }
 
     return (
-        <div className="min-h-screen">
-            <header className="flex items-center justify-between border-b bg-white px-6 py-4">
-                <div>
-                    <span className="text-sm font-semibold text-gray-900">
-                        RiskLens
-                    </span>
-
-                    {organization && (
-                        <span className="ml-3 text-sm text-gray-500">
-                            {organization.organization.name}
+        <OrganizationProvider
+            value={{
+                organization: organization?.organization ?? null,
+                role: organization?.role ?? null,
+                refresh: refreshOrganization,
+            }}
+        >
+            <div className="min-h-screen">
+                <header className="flex items-center justify-between border-b bg-white px-6 py-4">
+                    <div className="flex items-center gap-6">
+                        <span className="text-sm font-semibold text-gray-900">
+                            RiskLens
                         </span>
-                    )}
-                </div>
 
-                <button
-                    type="button"
-                    onClick={handleSignOut}
-                    disabled={signingOut}
-                    className="rounded-lg border px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                >
-                    {signingOut ? "Signing out..." : "Sign out"}
-                </button>
-            </header>
+                        <nav className="flex items-center gap-4">
+                            {NAV_LINKS.map((link) => {
+                                const isActive = pathname?.startsWith(
+                                    link.href
+                                );
 
-            {children}
-        </div>
+                                return (
+                                    <Link
+                                        key={link.href}
+                                        href={link.href}
+                                        className={
+                                            isActive
+                                                ? "text-sm font-medium text-gray-900"
+                                                : "text-sm text-gray-500 hover:text-gray-900"
+                                        }
+                                    >
+                                        {link.label}
+                                    </Link>
+                                );
+                            })}
+                        </nav>
+
+                        {organization && (
+                            <div className="border-l pl-6">
+                                <OrganizationMenu
+                                    organization={organization.organization}
+                                />
+                            </div>
+                        )}
+                    </div>
+
+                    <button
+                        type="button"
+                        onClick={handleSignOut}
+                        disabled={signingOut}
+                        className="rounded-lg border px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                    >
+                        {signingOut ? "Signing out..." : "Sign out"}
+                    </button>
+                </header>
+
+                {children}
+            </div>
+        </OrganizationProvider>
     );
 }

@@ -1,6 +1,6 @@
-export const CREATE_ORGANIZATION = `
-  mutation CreateOrganization($input: CreateOrganizationInput!) {
-    createOrganization(input: $input) {
+export const UPDATE_ORGANIZATION = `
+  mutation UpdateOrganization($input: UpdateOrganizationInput!) {
+    updateOrganization(input: $input) {
       id
       name
       email

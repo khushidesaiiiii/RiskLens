@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 import {
     login,
@@ -28,7 +29,7 @@ export default function LoginPage() {
                     !cancelled &&
                     session.tokens?.accessToken
                 ) {
-                    router.replace("/incidents");
+                    router.replace("/dashboard");
                 }
             } catch {
                 // No authenticated session.
@@ -56,7 +57,7 @@ export default function LoginPage() {
                 throw new Error("Additional authentication is required.");
             }
 
-            router.replace("/incidents");
+            router.replace("/dashboard");
         } catch (error) {
             console.error("Login failed:", error);
 
@@ -140,6 +141,16 @@ export default function LoginPage() {
                         {loading ? "Signing in..." : "Sign in"}
                     </button>
                 </form>
+
+                <p className="mt-6 text-center text-sm text-gray-600">
+                    Don&apos;t have an account?{" "}
+                    <Link
+                        href="/signup"
+                        className="font-medium text-black hover:underline"
+                    >
+                        Sign up
+                    </Link>
+                </p>
             </div>
         </main>
     );

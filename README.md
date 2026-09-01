@@ -40,6 +40,13 @@ Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management
 Status: Local implementation done — AWS Console changes + data
         migration required before this phase is live (see
         Multi-Tenancy below)
+
+Signup & Email Verification
+Status: Implemented locally — Cognito signup/verification is a separate
+        flow from organization creation and does not require any
+        AppSync/DynamoDB change; depends on Cognito Console settings
+        (self-registration, email verification) being enabled — see
+        Signup & Email Verification below
 ```
 
 The original 10-phase roadmap scoped "AppSync + GraphQL API layer" and
@@ -300,6 +307,212 @@ current (unresolved by Phase 2) — see [Future Risks](#future-risks).
 
 ---
 
+## Authenticated Application Flow
+
+```text
+Cognito Identity (signup / email verification / login)
+        ↓
+Application Authentication (src/lib/auth.js, src/app/(app)/layout.js session check)
+        ↓
+Organization Resolution (getMyOrganization(), src/app/(app)/layout.js)
+    ├── organization exists  → Dashboard (/dashboard)
+    └── organization is null → mandatory Organization Onboarding (no skip)
+                                        ↓
+                                createOrganization()
+                                        ↓
+                                getMyOrganization() re-fetched (source of truth,
+                                not the mutation's own return value)
+                                        ↓
+                                    Dashboard
+        ↓
+Application Modules (currently: Incident Management, via Dashboard navigation)
+```
+
+**`/dashboard` is the authenticated application's entry point, not
+`/incidents`.** Both `/login` and `/signup` redirect to `/dashboard`
+after a successful sign-in (`src/app/login/page.js`,
+`src/app/signup/page.js`); `/` (`src/app/page.js`) already redirected to
+`/dashboard` before this change and still does. `/incidents`,
+`/incidents/new`, and `/incidents/[id]` are unchanged and still fully
+functional — they're reached through the shared header's navigation
+(`NAV_LINKS` in `src/app/(app)/layout.js`) or Dashboard's "Incident
+Management" module card, not by being the post-login landing page. The
+header's organization name/logo is also a dropdown
+(`OrganizationMenu.js`) with two destinations: **Organization**
+(`/organization` — editable organization details, see
+[Organization Details](#organization-details-editing)) and **My
+Account** (`/account` — a static placeholder for now).
+
+**One shared gate, not four separate checks.** `src/app/(app)/layout.js`
+wraps every route under `(app)/` (`/dashboard`, `/incidents`,
+`/incidents/new`, `/incidents/[id]`) and runs the session check +
+`getMyOrganization()` call exactly once per mount, before rendering
+whichever page was requested. This means the mandatory-onboarding rule
+is enforced structurally — there is no route-specific bypass to
+accidentally miss — rather than requiring the same check to be
+duplicated on every page.
+
+**`myOrganization`'s error is not "no organization."** The layout has
+three distinct states after the session check: `no-organization` (a
+*successful* `getMyOrganization()` call that returned `null` —
+onboarding, mandatory), `organization-error` (the call *threw* —
+network/GraphQL/auth failure — shows a message with a **Retry** button,
+never onboarding), and `authenticated` (a membership was returned).
+Collapsing the error case into "no organization" would incorrectly send
+a user with an existing organization into the onboarding form during a
+transient AppSync hiccup — this is deliberately guarded against.
+
+**`OrganizationProvider`/`useOrganization()`**
+(`src/components/organization/OrganizationContext.js`) makes the
+current organization (`id`, `name`, `email`, `address`, `street`,
+`state`, `country`, `logoKey`, plus the caller's `role`) and a
+`refresh()` function available to `/dashboard` and any future module,
+without re-querying `getMyOrganization()` from every page. It's the
+**only** organization context in the app — reuse it rather than adding
+a second one. It's deliberately shaped around a single "current
+organization" today (matching the server's one-organization-per-user
+enforcement — see `CLAUDE.md` → Multi-Tenancy Rules) but doesn't hard-code
+that assumption into its shape, so a future organization switcher could
+extend the same context (e.g. add `organizations`/`switchOrganization`)
+without changing how `organization`/`role`/`refresh` are consumed by
+existing code.
+
+---
+
+## Signup & Email Verification
+
+```text
+Status: Implemented locally (application code only). Depends on Cognito
+        User Pool self-registration + email verification being enabled
+        in the Console — not something this repo can turn on for you.
+```
+
+**Signup and organization creation are two separate, sequential flows —
+this is deliberate, not an oversight.** Cognito signup only ever creates
+a Cognito user; it never touches DynamoDB, AppSync, or the Organization
+model.
+
+```text
+Cognito User (new)
+    ↓ signUp()
+Email verification code sent by Cognito
+    ↓ confirmSignUp()
+Cognito user CONFIRMED
+    ↓ sign in (login())
+Authenticated Cognito session
+    ↓ (existing, unchanged) (app)/layout.js -> getMyOrganization()
+myOrganization === null
+    ↓ (existing, unchanged) create-organization onboarding
+createOrganization({ name })
+```
+
+### What's implemented
+
+- **`src/lib/auth.js`** — three new functions, following the same
+  pattern as the existing `login`/`logout`/`getAuthSession`
+  (`aws-amplify/auth` is only ever imported here, never from a page):
+  - `signUp(email, password)` — creates the Cognito user
+    (`username: email`, `options.userAttributes.email`). Does **not**
+    create an Organization or Membership, and does not accept an
+    `organizationId` parameter — there's nowhere to pass one.
+  - `confirmSignUp(email, confirmationCode)` — confirms the account with
+    the code Cognito emailed the user.
+  - `resendSignUpCode(email)` — re-sends the verification code.
+  - All three catch Cognito's raw errors, log them, and re-throw a
+    friendlier message (mapped from `error.name` — e.g.
+    `UsernameExistsException`, `InvalidPasswordException`,
+    `CodeMismatchException`, `ExpiredCodeException`,
+    `LimitExceededException`) without exposing internal Cognito details
+    beyond what the message already needs to say.
+- **`src/app/signup/page.js`** (new route, no auth required) — a small
+  state machine with three states:
+  1. **`signup`** — email / password / confirm-password form, validated
+     client-side (required fields, email format, password match) before
+     calling `signUp()`. Cognito's own password policy is not
+     re-implemented here — Cognito rejects a weak password and the
+     mapped error message is shown.
+  2. **`verify`** — shown after `signUp()` succeeds with
+     `nextStep.signUpStep === "CONFIRM_SIGN_UP"`. Has the code input,
+     "Verify Email", "Resend Code", and "Back to sign up" actions, each
+     with its own loading state.
+  3. **`verified`** — shown only if automatic sign-in after confirmation
+     doesn't complete (see below); a simple "Sign in" button to
+     `/login`.
+  - **Neither `createOrganization` nor `myOrganization` is called
+    anywhere in this file** — confirmed by grep, not just by writing it
+    that way.
+- **`src/app/login/page.js`** — added a "Don't have an account? Sign
+  up" link to `/signup`. `handleSubmit`, `login()`, the existing-session
+  redirect, and all existing error/loading handling are unchanged.
+
+### Post-confirmation sign-in
+
+After `confirmSignUp()` succeeds, the signup page immediately calls the
+**existing** `login(email, password)` (the same function `/login` uses)
+with the credentials already entered on the signup form:
+
+- If it returns `isSignedIn: true`, the user is redirected to
+  `/dashboard` (the authenticated app's entry point — see
+  [Authenticated Application Flow](#authenticated-application-flow)),
+  where `src/app/(app)/layout.js` calls `getMyOrganization()` and —
+  since a brand-new user has no membership — shows the existing
+  create-organization onboarding instead of the Dashboard. No
+  organization-detection logic was duplicated in the signup page; it
+  relies entirely on the layout that already does this for `/login`.
+- If sign-in doesn't complete for any reason (Cognito can require this
+  depending on User Pool policy — e.g. MFA), the page falls back to the
+  `verified` state and points the user at `/login` instead of retrying
+  silently or swallowing the error.
+
+### AWS Console steps required
+
+Signup does not need any AppSync, DynamoDB, or GraphQL schema change —
+it's pure Cognito, using the same User Pool and the same public app
+client that login already uses. What needs to be verified/enabled in
+the Console (I cannot check or change these — the local IAM user is
+denied `cognito-idp:DescribeUserPoolClient` — so this is a checklist,
+not a confirmed-done change):
+
+1. **Cognito → User pools → your pool → "Sign-up experience"** — confirm
+   **self-registration is enabled**. If it's off, `signUp()` fails
+   (typically `NotAuthorizedException` or a message referencing
+   self-service sign-up being disabled) — turn it on.
+2. **Same tab → "Cognito-assisted verification and confirmation"** —
+   confirm email is set up to auto-send a verification code on signup
+   (this app calls no Lambda trigger and sends no email itself; it
+   relies entirely on Cognito's built-in verification email). No SES
+   configuration was added or changed by this work.
+3. **App client settings** — confirm the same public app client already
+   used for login has the auth flow `login()` depends on enabled
+   (unchanged by this work; only relevant if signup surfaces an
+   auth-flow error that login doesn't).
+4. No new environment variables are required — signup uses the same
+   `NEXT_PUBLIC_COGNITO_USER_POOL_ID` / `NEXT_PUBLIC_COGNITO_CLIENT_ID` /
+   `NEXT_PUBLIC_COGNITO_REGION` already configured for login.
+
+### Manual test checklist (not run by me — no test Cognito credentials)
+
+1. `/login` shows a "Sign up" link; `/signup` loads without
+   authentication.
+2. Sign up with a new email + matching passwords → lands on the
+   "Check your email" verification state.
+3. Enter a wrong code → friendly "incorrect code" error, not a raw
+   Cognito exception.
+4. Click "Resend Code" → confirmation message shown, a new code
+   arrives.
+5. Enter the correct code → either lands directly on `/dashboard` with
+   the create-organization form (first-time user), or shows "Email
+   verified — Sign in" if automatic sign-in didn't complete.
+6. Sign up again with the same email → "account already exists" error
+   at the form step, not after submitting to Cognito twice.
+7. Confirm in DynamoDB Console that **no** `Organization` or
+   `OrganizationMembership` item was written by signup alone — only
+   `createOrganization` (a separate, later user action) writes those.
+8. Existing `/login` flow (email/password → `/dashboard`) still works
+   unchanged for a pre-existing confirmed user.
+
+---
+
 ## DynamoDB Single Table Design
 
 ```text
@@ -336,6 +549,9 @@ requires the AWS Console changes and migration script in
 pk                    sk                  Used by
 ────────────────────────────────────────────────────────────────
 ORG#<orgId>           METADATA            myOrganization
+                      (name, email, address, street, state, country,
+                       logoKey — logoKey is an S3 object key reference
+                       only, never image bytes/base64)
 ORG#<orgId>           USER#<cognitoSub>   myOrganization (via GSI2), future membership listing
 ORG#<orgId>           INCIDENT#<id>       incidents, incident(id), createIncident
 
@@ -367,6 +583,22 @@ Status: Local implementation done. AWS Console changes + data migration
         steps below.
 ```
 
+> **Correction found while implementing Organization Onboarding:**
+> `infrastructure/appsync/` and `scripts/` existed as empty directories
+> on disk — the schema SDL, `resolveCallerOrganization.function.js`,
+> and `Mutation.createOrganization.js` this document referenced from
+> earlier work were never actually saved, despite being described as
+> done. They have been (re)created as part of this pass with the
+> Organization Onboarding fields included from the start. **The
+> incident-tenancy resolvers this document still references
+> (`Query.myOrganization.js`, `Query.incidents.js`, `Query.incident.js`,
+> `Mutation.createIncident.js`) and the migration script
+> (`scripts/migrate-incidents-to-organizations.mjs`) are still missing
+> and were out of scope for this task** — see
+> [Known Issues](#known-issues-verified-in-current-code). Don't assume
+> they exist just because earlier sections of this README describe
+> them.
+
 ### Architecture
 
 ```text
@@ -391,38 +623,49 @@ GraphQL argument shapes for `incidents`/`incident`/`createIncident` are
 - `src/graphql/queries/organization.js` — `GetMyOrganization` query
   (no arguments).
 - `src/lib/organization.js` — `getMyOrganization()`, returns
-  `{ organization: { id, name, createdAt, updatedAt }, role }` or
-  `null` if the caller has no organization membership. Follows the
-  same service-layer pattern as `src/lib/incidents.js` — no GraphQL
-  strings or AWS details above this layer.
+  `{ organization: { id, name, email, address, street, state, country,
+  logoKey, createdAt, updatedAt }, role }` or `null` if the caller has
+  no organization membership. Follows the same service-layer pattern as
+  `src/lib/incidents.js` — no GraphQL strings or AWS details above this
+  layer.
 - `src/app/(app)/layout.js` — after confirming a Cognito session, loads
-  the caller's organization and shows its name in the header. Added two
-  new states: **no-organization** (clear message + sign-out, for a
-  Cognito user with no membership row yet) and
-  **organization-error** (network/GraphQL failure loading the org,
-  distinct from a session failure).
+  the caller's organization and shows its name + logo in the header.
+  Has three states beyond the normal authenticated view:
+  **no-organization** (mandatory onboarding — see
+  [Organization Onboarding](#organization-onboarding) below, no skip
+  option), **organization-error** (network/GraphQL failure loading the
+  org, distinct from a session failure), and the normal authenticated
+  header once a membership exists.
 - `/incidents`, `/incidents/new`, `/incidents/[id]` — **unchanged**.
   Tenant scoping happens entirely in the resolver; these pages already
   only call `src/lib/incidents.js`, so there was nothing for them to do
   differently.
-- `infrastructure/appsync/` — the exact schema SDL and AppSync JS
-  resolver code to paste into AWS Console (see below). Not deployed by
-  this repo — there is no infrastructure-as-code wired up for this
-  AppSync API.
-- `scripts/migrate-incidents-to-organizations.mjs` — dry-run-by-default,
-  idempotent migration script. **Not executed** — it writes to the real
-  DynamoDB table, so it's handed over for you to run deliberately (see
-  [Migration](#migration) below).
-- `src/graphql/mutations/createOrganization.js`,
-  `src/lib/organization.js` (`createOrganization(name)`) — lets an
-  authenticated user with no organization create one. The client only
-  ever sends `name`; `id`, the creator's `OWNER` membership, and the
-  GSI2 attributes are all generated server-side (see
-  [Organization Creation](#organization-creation) below).
-- `src/app/(app)/layout.js` — the **no-organization** state is now a
-  real form (name input, Create button, loading/validation/GraphQL
-  error states) instead of a dead end. On success it updates the header
-  immediately and redirects to `/incidents`.
+- `infrastructure/appsync/schema-organizations.graphql`,
+  `infrastructure/appsync/resolvers/resolveCallerOrganization.function.js`,
+  `infrastructure/appsync/resolvers/Mutation.createOrganization.js` —
+  the schema SDL and AppSync JS resolver code to paste into AWS
+  Console (see below). Not deployed by this repo — there is no
+  infrastructure-as-code wired up for this AppSync API.
+- `scripts/migrate-incidents-to-organizations.mjs` — **referenced by
+  this document but not present in the repo right now** — see the
+  correction note above. Do not assume it exists; it needs to be
+  (re)written before the DynamoDB migration in
+  [Migration](#migration) can run.
+- `src/graphql/mutations/createOrganization.js`, `src/lib/storage.js`,
+  `src/components/organization/OrganizationOnboardingForm.js`,
+  `src/components/organization/OrganizationLogo.js` — the full
+  Organization Onboarding flow: a form collecting name, email, address,
+  street, state, country (required) and a logo (optional, uploaded
+  straight to S3 — never sent through GraphQL). The client only ever
+  sends those business fields plus an S3 key reference; `id`, the
+  creator's `OWNER` membership, and the GSI2 attributes are all
+  generated server-side (see
+  [Organization Onboarding](#organization-onboarding) below).
+- `src/lib/amplify.js` — optionally configures Amplify `Storage` +
+  `Auth.Cognito.identityPoolId` when the corresponding env vars are
+  present, without touching the required Cognito User Pool config —
+  login and AppSync keep working even if S3/Identity Pool haven't been
+  set up yet.
 
 ### Tenant isolation design
 
@@ -499,6 +742,11 @@ none of them can be performed from this repository.
    - `Query.incidents` (replace existing) → `infrastructure/appsync/resolvers/Query.incidents.js`
    - `Query.incident` (replace existing) → `infrastructure/appsync/resolvers/Query.incident.js`
    - `Mutation.createIncident` (replace existing) → `infrastructure/appsync/resolvers/Mutation.createIncident.js`
+   - **These four files do not currently exist in this repo** (see the
+     correction note at the top of this section) — they need to be
+     (re)written before this step can be completed. Only
+     `resolveCallerOrganization.function.js` and
+     `Mutation.createOrganization.js` (step 5) exist right now.
    - **Why:** these are the resolvers that actually enforce the tenant
      boundary — without this step, the schema/GSI changes above do
      nothing.
@@ -507,11 +755,12 @@ none of them can be performed from this repository.
      don't just trust that the console accepted the paste.
 
 5. **AppSync → Schema → add `createOrganization`.** Paste the
-   `CreateOrganizationInput` input type and the `createOrganization`
-   field (added into your existing `type Mutation { ... }` block) from
-   the same `infrastructure/appsync/schema-organizations.graphql` file
-   used in step 2. Then attach a **new** pipeline resolver on
-   `Mutation.createOrganization`, runtime APPSYNC_JS, with:
+   `CreateOrganizationInput` input type, the extended `Organization`
+   type, and the `createOrganization` field (added into your existing
+   `type Mutation { ... }` block) from
+   `infrastructure/appsync/schema-organizations.graphql`. Then attach a
+   pipeline resolver on `Mutation.createOrganization`, runtime
+   APPSYNC_JS, with:
    - Step 1: the **same** `resolveCallerOrganization` Function from
      step 3 (no new Function needed)
    - Step 2: `infrastructure/appsync/resolvers/Mutation.createOrganization.js`
@@ -519,20 +768,133 @@ none of them can be performed from this repository.
      convenience — it's what lets step 2 detect "this caller already has
      an organization" and refuse to create a second one (this project is
      one-organization-per-user for now).
-   - **Verify:** see [Organization Creation](#organization-creation)
+   - **Verify:** see [Organization Onboarding](#organization-onboarding)
      below for the full checklist.
 
-**Not required:** a second DynamoDB table, a second Cognito User Pool,
-API Gateway, or any change to Cognito itself (identity/authentication is
-unchanged — only application-level authorization is new).
+6. **S3 + Cognito Identity Pool for logo uploads** (new — see
+   [Organization Onboarding](#organization-onboarding) for the full
+   design/rationale):
+   1. Create a **private** S3 bucket (block all public access —
+      no public-read, no public-write). Note its name and region.
+   2. Create a **Cognito Identity Pool**, with your existing Cognito
+      User Pool + app client added as an authentication provider.
+      Enable **"Attributes for access control"** (ABAC) on the Identity
+      Pool with a **custom mapping**: map the `sub` claim to principal
+      tag `sub`. This is what lets the S3 IAM policy and the AppSync
+      resolver agree on the same identifier — see
+      [Organization Onboarding](#organization-onboarding) for why this
+      matters.
+   3. On the Identity Pool's **authenticated** IAM role, attach a
+      policy scoped to the caller's own tag-derived prefix only:
+      ```json
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+            "Resource": "arn:aws:s3:::<BUCKET_NAME>/temporary/organizations/${aws:PrincipalTag/sub}/*"
+          }
+        ]
+      }
+      ```
+   4. Add `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` (already present as a
+      key in `.env` — confirm it has the real Identity Pool ID),
+      `NEXT_PUBLIC_S3_BUCKET_NAME`, and `NEXT_PUBLIC_S3_REGION` to
+      `.env` — see [Environment Variables](#environment-variables).
+   - **Why an Identity Pool at all, when AppSync itself authorizes via
+     the User Pool directly?** S3 has no equivalent of "Cognito User
+     Pool authorization" the way AppSync does — browser-to-S3 uploads
+     need real (temporary) AWS credentials, which only an Identity Pool
+     can mint from a Cognito User Pool session. No static AWS keys are
+     ever placed in the browser; Amplify Storage requests short-lived
+     STS credentials scoped by the IAM policy above.
+   - **Verify:** see the manual test checklist in
+     [Organization Onboarding](#organization-onboarding).
 
-### Organization Creation
+**Not required:** a second DynamoDB table, a second Cognito User Pool,
+API Gateway, or a Lambda function (see the note in
+[Organization Onboarding](#organization-onboarding) about why the logo
+key is never renamed/moved).
+
+### Organization Onboarding
 
 `createOrganization(input: CreateOrganizationInput!): Organization!` —
-`CreateOrganizationInput` has exactly one field, `name`. There is no
-way for the client to submit `organizationId`, `userId`, `role`, or the
-GSI2 attributes — the schema simply has no fields for them, so this
-isn't just a resolver-side check, it's structurally impossible.
+`CreateOrganizationInput` has exactly six required business fields
+(`name`, `email`, `address`, `street`, `state`, `country`) plus one
+optional `logoKey`. There is no way for the client to submit
+`organizationId`, `userId`, `role`, `pk`/`sk`, or the GSI2 attributes —
+the schema simply has no fields for them, so this isn't just a
+resolver-side check, it's structurally impossible.
+
+**Onboarding is mandatory, with no skip option.** `src/app/(app)/layout.js`
+shows `src/components/organization/OrganizationOnboardingForm.js`
+instead of Dashboard/Incidents whenever `myOrganization()` returns
+`null` — there is no way to dismiss it or reach `/dashboard`,
+`/incidents`, or any other authenticated route without completing it,
+since the check happens once in the shared layout, not per-page. See
+[Authenticated Application Flow](#authenticated-application-flow) for
+the full picture and [How persistence works](#how-persistence-across-loginlogout-works)
+below for why existing members skip straight past it every time.
+
+#### Logo storage: why S3, and why not a straightforward "upload then move"
+
+The logo is a real image file, so it cannot go through GraphQL as
+base64/binary (bloats the DynamoDB item, no size limit enforcement,
+and defeats the point of object storage) and cannot be written to
+DynamoDB directly. It has to live in S3, referenced from DynamoDB by
+key only (`logoKey`) — exactly as this document's DynamoDB section
+shows.
+
+The complication: `createOrganization` generates `organizationId`
+**server-side**, so at the moment the browser needs to upload a logo,
+no organization (and therefore no `organizations/<orgId>/...` key)
+exists yet. The chosen design:
+
+1. The browser uploads the logo **before** calling `createOrganization`,
+   to a key scoped to the caller's own Cognito identity:
+   `temporary/organizations/<cognito-sub>/<random-id>/<filename>`
+   (`src/lib/storage.js`'s `uploadOrganizationLogo()`, via Amplify
+   Storage — see below for how this is kept secure).
+2. `createOrganization` receives that key as `logoKey`, validates it
+   **starts with `temporary/organizations/<ctx.identity.sub>/`**
+   (`Mutation.createOrganization.js`'s `validatedLogoKey()`) — a
+   caller cannot point `logoKey` at another user's upload or an
+   arbitrary S3 object — and stores it in the new `Organization` item
+   as-is.
+3. **The object is not physically renamed/moved to
+   `organizations/<orgId>/logo/<filename>`.** Doing that for real
+   (S3 `CopyObject` + `DeleteObject`) would need to run in the AppSync
+   resolver, which only talks to the DynamoDB data source here — a
+   real move would require a Lambda function, which this project
+   doesn't have yet (Lambda is still "Planned", not built — see
+   [Technology Stack](#technology-stack)). Building one was out of
+   scope for this task ("don't make unrelated changes"). The `temporary/`
+   prefix in the key is therefore misleading in the literal sense — the
+   object stays there permanently once an Organization references it.
+   This is a **documented, deliberate simplification**, not an
+   oversight; if/when Lambda is introduced, moving the object to a
+   cleaner `organizations/<orgId>/logo/<filename>` key (and updating
+   `logoKey`) becomes straightforward.
+
+**How the upload is kept secure (no backend server, no exposed
+credentials):** the browser gets short-lived AWS credentials from a
+**Cognito Identity Pool** (federated from the same Cognito User Pool
+session already used for login) via Amplify Storage — never static
+AWS access keys. The Identity Pool is configured with **ABAC
+(Attributes for access control)** mapping the User Pool's `sub` claim
+to a principal tag, so the S3 IAM policy can scope
+`PutObject`/`GetObject`/`DeleteObject` to
+`temporary/organizations/${aws:PrincipalTag/sub}/*` — the **same**
+`sub` value AppSync's resolver reads from `ctx.identity.sub`. That's
+deliberate: it means the S3-side access boundary and the
+`Mutation.createOrganization.js` validation boundary are enforced
+against the exact same identifier, not two identity systems that
+merely happen to look similar. See AWS Console step 6 above for the
+exact IAM policy and Identity Pool configuration this assumes — **none
+of it exists yet**, so logo upload will fail with a clear "not
+configured yet" error (`src/lib/storage.js`) until it's set up; the
+rest of onboarding (all the required text fields) works without it.
 
 **Flow:**
 1. `resolveCallerOrganization` (pipeline step 1) looks up an existing
@@ -540,23 +902,36 @@ isn't just a resolver-side check, it's structurally impossible.
    `AlreadyHasOrganization` — this keeps the current one-org-per-user
    design intact (see below) rather than silently creating an orphaned
    second organization.
-2. The resolver validates `name` (non-empty, ≤100 chars after
-   trimming), generates `organizationId` as `org-<8 random hex chars>`
-   (server-side — the client never generates or supplies it), and
-   determines the creator from `ctx.identity.sub`.
-3. It writes the `Organization` item and the creator's `OWNER`
-   `OrganizationMembership` item (with `GSI2PK`/`GSI2SK` already set)
-   using a single DynamoDB **`TransactWriteItems`** call — both items
-   are written together or neither is. This is genuinely atomic (that's
-   what `TransactWriteItems` guarantees), not an approximation of it.
+2. The resolver validates all six required fields (non-empty after
+   trimming, length-capped) and the organization email
+   (`name@domain.tld` shape), validates `logoKey` as described above if
+   present, generates `organizationId` as `org-<8 random hex chars>`
+   (server-side), and determines the creator from `ctx.identity.sub`.
+3. It writes the `Organization` item (now including `email`, `address`,
+   `street`, `state`, `country`, `logoKey`, `entityType`) and the
+   creator's `OWNER` `OrganizationMembership` item (with
+   `GSI2PK`/`GSI2SK` already set) using a single DynamoDB
+   **`TransactWriteItems`** call — both items are written together or
+   neither is. This is genuinely atomic (that's what
+   `TransactWriteItems` guarantees), not an approximation of it.
 4. Returns the new `Organization`.
+
+If the DynamoDB write fails **after** a logo was already uploaded, the
+onboarding form (`OrganizationOnboardingForm.js`) calls
+`deleteUploadedLogo()` to clean up the now-orphaned S3 object on a
+best-effort basis (failures there are logged, not surfaced — losing a
+stray temp file isn't worth blocking the user's error message over),
+and preserves everything the user typed so they don't have to retype it.
+
+#### How persistence across login/logout works
 
 **Because a user's Cognito identity (`sub`) doesn't change across
 sessions, and membership is a persistent DynamoDB record**, a user who
 creates an organization will resolve back to that same organization on
 every future login automatically — `myOrganization`'s GSI2 lookup finds
 the same membership row every time. No extra "remember my org" logic
-was needed for this.
+was needed for this, and the onboarding form never appears again for
+that user.
 
 **One organization per user (for now):** `resolveCallerOrganization`'s
 GSI2 query already takes only the first result (`limit: 1`). Multi-org
@@ -568,16 +943,19 @@ rows across different orgs), so a future "switch organization" feature
 would mean changing `myOrganization` to accept an org id and list all
 of a user's memberships, rather than reshaping the stored data.
 
-**Verification checklist (do this after completing step 5 above):**
-1. In AppSync Console, use the query editor (or "Run a Query" test
-   tool) to call `createOrganization(input: { name: "Test Org" })` as
-   an authenticated Cognito user with no existing membership. It should
-   return an `Organization` with a generated `id` like `org-xxxxxxxx`.
+**Verification checklist (do this after completing steps 5–6 above):**
+1. In AppSync Console, call `createOrganization(input: { name: "RiskLens
+   Test Organization", email: "org@example.com", address: "123 Main
+   Road", street: "Main Road", state: "Gujarat", country: "India" })` as
+   an authenticated Cognito user with no existing membership (omit
+   `logoKey` for this first check). It should return an `Organization`
+   with a generated `id` like `org-xxxxxxxx`.
 2. Call it again as the **same** user — it should fail with
    `AlreadyHasOrganization`, not create a second organization.
 3. In DynamoDB Console, check the RiskLens table for
-   `pk=ORG#<the-new-id>, sk=METADATA` — confirm `name`, `createdAt`,
-   `updatedAt` are present.
+   `pk=ORG#<the-new-id>, sk=METADATA` — confirm `name`, `email`,
+   `address`, `street`, `state`, `country`, `createdAt`, `updatedAt` are
+   present and `logoKey` is absent/null.
 4. Check for `pk=ORG#<the-new-id>, sk=USER#<your-sub>` — confirm
    `role=OWNER`, `organizationId` matches, and `GSI2PK=USER#<your-sub>`
    / `GSI2SK=ORG#<the-new-id>` are both present.
@@ -585,16 +963,106 @@ of a user's memberships, rather than reshaping the stored data.
    `GSI2PK = USER#<your-sub>`) and confirm it returns that membership
    item.
 6. Call `myOrganization` as that user — confirm it returns the same
-   `id`, `name`, and `role: "OWNER"`.
-7. In the app: sign in as a user with no org → confirm the create-org
-   form appears → submit a name → confirm redirect to `/incidents` and
-   the header shows the new organization's name → sign out, sign back
-   in → confirm the same organization loads again (no re-prompt).
+   `id`, all the business fields, and `role: "OWNER"`.
+7. Once the S3/Identity Pool steps are done: in the app, sign in as a
+   user with no org → confirm the onboarding form appears with no skip
+   option → fill in all required fields → select a PNG/JPEG/WebP logo
+   → confirm it shows a preview and an "Uploading..."/uploaded state →
+   submit → confirm `getMyOrganization()` is called again (not just the
+   mutation's return value) → confirm redirect to `/dashboard` and the
+   header (and Dashboard itself) show the new organization's name and
+   logo → confirm Incidents is reachable from Dashboard's navigation.
+8. In S3 Console, confirm the uploaded object exists at
+   `temporary/organizations/<your-sub>/<random-id>/<filename>` in the
+   configured bucket.
+9. Refresh the page, and separately sign out and sign back in — confirm
+   the same organization loads again immediately, with no re-prompt.
+10. Try uploading a `.pdf` or a 20MB image — confirm both are rejected
+    client-side with a clear message before any upload is attempted.
 
 None of this has been run yet — it requires the AWS Console changes
 above first, and I have no way to create a real Cognito-authenticated
-GraphQL request myself (no test user credentials, no IAM permission to
-mint one).
+GraphQL request or AWS credentials myself (no test user credentials, no
+IAM permission to mint one).
+
+### Organization Details (editing)
+
+`updateOrganization(input: UpdateOrganizationInput!): Organization!` —
+same six required business fields plus optional `logoKey` as
+`createOrganization`, but for an **existing** organization. Reachable
+from the header: click the chevron next to the organization
+name/logo (`src/components/organization/OrganizationMenu.js`) →
+"Organization" → `/organization`
+(`src/app/(app)/organization/page.js`, form logic in
+`src/components/organization/OrganizationDetailsForm.js`, pre-filled
+with the current organization's data from `useOrganization()`). The
+same dropdown has a "My Account" option → `/account` — currently a
+static placeholder page, as requested; no account-management feature
+exists yet.
+
+**The organization being updated is always the caller's own — never a
+client-supplied id.** `Mutation.updateOrganization.js` uses the same
+`resolveCallerOrganization` pipeline Function as every other
+organization-scoped resolver: it reads `ctx.stash.organizationId` (set
+from the caller's `OrganizationMembership`, looked up via
+`ctx.identity.sub`) and updates `pk=ORG#<that-id>/sk=METADATA` —
+`UpdateOrganizationInput` has no `organizationId` field for the client
+to submit in the first place. If the caller has no membership, the
+resolver raises `NoOrganizationMembership` instead of creating or
+updating anything.
+
+Unlike `createOrganization` (which needs a real multi-item
+`TransactWriteItems`), this is a single-item update, so the resolver
+uses the `@aws-appsync/utils/dynamodb` `update()` helper directly
+rather than a hand-built request — simpler and just as correct for a
+single `UpdateItem` call. Logo replacement reuses the exact same
+upload/validation path as onboarding
+(`src/lib/storage.js`); the previously-saved logo is only deleted from
+S3 **after** a successful save (never before), so a failed save or an
+abandoned edit never destroys the organization's live logo.
+
+**No role gating on who can edit organization details yet** — any
+member can currently update it (in practice, currently always the
+`OWNER`, since there's no invite flow to create `ADMIN`/`MEMBER`
+members). This matches the project's existing "don't build role-gated
+logic speculatively" rule — see `CLAUDE.md` → Multi-Tenancy Rules. If
+member invitations are ever added, revisit this.
+
+**"Create new organization" is intentionally a disabled, no-op
+button** on `/organization` — multi-organization support isn't built
+(see [Authenticated Application Flow](#authenticated-application-flow)
+for `OrganizationContext`'s future-org-switcher-ready design). It's
+there so the eventual org switcher has an obvious place to attach to,
+without pretending the feature exists today.
+
+**AWS Console step required (in addition to the ones above):** add
+`UpdateOrganizationInput` and the `updateOrganization` field from
+`infrastructure/appsync/schema-organizations.graphql` to your schema,
+then attach a pipeline resolver on `Mutation.updateOrganization`
+(runtime APPSYNC_JS): step 1 the same `resolveCallerOrganization`
+Function already created, step 2
+`infrastructure/appsync/resolvers/Mutation.updateOrganization.js`. Not
+deployed or verified live — same caveat as every other AppSync change
+in this document.
+
+**Manual test checklist (not run by me):**
+1. As a user with an existing organization, open `/organization` —
+   confirm the form is pre-filled with the real saved values, not
+   blank.
+2. Change a field (e.g. name), save — confirm success message, confirm
+   the header/Dashboard immediately reflect the new name (via
+   `refresh()`, no manual page reload needed).
+3. Replace the logo — confirm the old S3 object no longer resolves
+   (best-effort delete) and the new one displays everywhere the
+   organization's logo appears.
+4. Remove the logo entirely and save — confirm `logoKey` becomes
+   absent in DynamoDB (`REMOVE`, not stored as an empty string) and the
+   header falls back to the initial-letter avatar.
+5. Submit invalid data (empty field, malformed email) — confirm a
+   clear client-side error, no request sent to AppSync.
+6. Confirm the "+ Create new organization" button is disabled and does
+   nothing when clicked.
+7. Confirm `/account` loads its static placeholder and does not throw.
 
 ### Migration
 
@@ -604,8 +1072,10 @@ targets for the OLD resolvers right up until step 4 above is applied —
 after that, the new resolvers only look under `ORG#<orgId>` partitions,
 so old-shape items become invisible to the app until migrated.
 
-Run `scripts/migrate-incidents-to-organizations.mjs` (see the header
-comment in that file for exact commands). It is a **dry run by default**
+Run `scripts/migrate-incidents-to-organizations.mjs` — **this file does
+not currently exist in the repo** (see the correction note at the top
+of [Multi-Tenancy](#multi-tenancy-phase-22)); the description below is
+what it needs to do, not a description of working code. It is a **dry run by default**
 — it prints its plan and writes nothing until you pass `--execute`, and
 even then it never deletes the old items unless you also pass
 `--delete-old`. It is idempotent — safe to run repeatedly, since every
@@ -677,9 +1147,27 @@ NEXT_PUBLIC_APPSYNC_API_KEY=your-appsync-api-key
 NEXT_PUBLIC_COGNITO_USER_POOL_ID=your-user-pool-id
 NEXT_PUBLIC_COGNITO_CLIENT_ID=your-client-id
 NEXT_PUBLIC_COGNITO_REGION=your-region
+
+# Organization logo uploads (Organization Onboarding) — optional; the
+# app works without these, just without logo upload. See
+# Multi-Tenancy -> AWS Console step 6.
+NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID=your-identity-pool-id
+NEXT_PUBLIC_S3_BUCKET_NAME=your-s3-bucket-name
+NEXT_PUBLIC_S3_REGION=your-s3-bucket-region
 ```
 
 - Values above are **placeholders only** — never commit real values.
+- `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` is already present as a key in
+  this project's `.env` (added ahead of this task); confirm it holds a
+  real Identity Pool ID before testing logo upload.
+  `NEXT_PUBLIC_S3_BUCKET_NAME`/`NEXT_PUBLIC_S3_REGION` are not yet
+  present and need to be added once the S3 bucket exists (Multi-Tenancy
+  → AWS Console step 6). `src/lib/amplify.js` only configures Amplify
+  `Storage` when all three are present — login/AppSync are completely
+  unaffected if they're missing, and `src/lib/storage.js` throws a
+  clear, catchable "not configured yet" error if a logo upload is
+  attempted without them (the rest of onboarding still works — logo is
+  optional).
 - `.gitignore` ignores `.env*`, which covers `.env`, `.env.local`, and
   `.env.*.local`.
 - Missing any of the Cognito variables produces a clear thrown error
@@ -713,18 +1201,27 @@ risklens/
 ├── src/
 │   ├── app/
 │   │   ├── (app)/                       # route group — no effect on URLs
-│   │   │   ├── layout.js                # client-side auth guard + sign-out header
-│   │   │   ├── dashboard/page.js        # static stat cards (not yet migrated)
+│   │   │   ├── layout.js                # auth guard + org gate + nav header + OrganizationProvider
+│   │   │   ├── dashboard/page.js        # authenticated entry point — org summary + module nav (stats still hardcoded)
+│   │   │   ├── account/page.js          # "My Account" — static placeholder, no functionality yet
+│   │   │   ├── organization/page.js     # editable Organization Details page
 │   │   │   └── incidents/
 │   │   │       ├── page.js              # list — wired to getIncidents(), pagination
 │   │   │       ├── new/page.js          # create form — wired to createIncident()
 │   │   │       └── [id]/page.js         # detail — wired to getIncident(id)
 │   │   ├── login/page.js                # sign-in form, uses src/lib/auth.js
+│   │   ├── signup/page.js               # signup + email verification, uses src/lib/auth.js
 │   │   ├── layout.js                    # root layout — mounts AmplifyProvider
 │   │   ├── page.js                      # redirects to /dashboard
 │   │   └── globals.css
 │   ├── components/
 │   │   ├── AmplifyProvider.js           # configures Amplify once, app-wide
+│   │   ├── organization/
+│   │   │   ├── OrganizationOnboardingForm.js  # mandatory onboarding form + logo upload (Phase 2.2)
+│   │   │   ├── OrganizationDetailsForm.js     # editable form for an EXISTING organization
+│   │   │   ├── OrganizationMenu.js      # header dropdown — My Account / Organization
+│   │   │   ├── OrganizationLogo.js      # resolves logoKey -> signed URL, falls back to an initial avatar
+│   │   │   └── OrganizationContext.js   # OrganizationProvider/useOrganization() — the only org context
 │   │   ├── incidents/                   # empty
 │   │   ├── layout/                      # empty
 │   │   └── ui/                          # empty
@@ -735,18 +1232,26 @@ risklens/
 │   │   ├── queries/incident.js          # GET_INCIDENT
 │   │   ├── queries/organization.js      # GET_MY_ORGANIZATION (Phase 2.2)
 │   │   ├── mutations/createIncident.js  # CREATE_INCIDENT
-│   │   └── mutations/createOrganization.js  # CREATE_ORGANIZATION (Phase 2.2)
+│   │   ├── mutations/createOrganization.js  # CREATE_ORGANIZATION (Phase 2.2)
+│   │   └── mutations/updateOrganization.js  # UPDATE_ORGANIZATION (Phase 2.2)
 │   └── lib/
-│       ├── amplify.js                   # configureAmplify()
-│       ├── auth.js                      # login/logout/getAuthenticatedUser/getAuthSession
+│       ├── amplify.js                   # configureAmplify() + isStorageConfigured()
+│       ├── auth.js                      # login/logout/getAuthenticatedUser/getAuthSession/signUp/confirmSignUp/resendSignUpCode
+│       ├── storage.js                   # uploadOrganizationLogo/deleteUploadedLogo/getOrganizationLogoUrl (Phase 2.2)
 │       ├── incidents.js                 # service layer: getIncidents/getIncident/createIncident
-│       ├── organization.js              # service layer: getMyOrganization/createOrganization (Phase 2.2)
+│       ├── organization.js              # service layer: getMyOrganization/createOrganization/updateOrganization (Phase 2.2)
 │       └── utils/                       # empty
 ├── infrastructure/appsync/              # Phase 2.2 — reference only, not deployed by this repo
 │   ├── schema-organizations.graphql     # SDL to paste into AppSync Console
-│   └── resolvers/                       # AppSync JS resolver code to paste into AppSync Console
+│   └── resolvers/
+│       ├── resolveCallerOrganization.function.js  # shared pipeline step 1 — exists
+│       ├── Mutation.createOrganization.js         # exists
+│       ├── Mutation.updateOrganization.js         # exists
+│       └── (Query.myOrganization.js, Query.incidents.js, Query.incident.js,
+│            Mutation.createIncident.js — referenced elsewhere in this
+│            document but NOT present; see Multi-Tenancy's correction note)
 ├── scripts/
-│   └── migrate-incidents-to-organizations.mjs  # Phase 2.2 migration — not run automatically
+│   └── migrate-incidents-to-organizations.mjs  # referenced but NOT present — see Multi-Tenancy
 ├── public/
 ├── .env                                 # local only, gitignored
 ├── .gitignore
@@ -791,7 +1296,7 @@ needs it is actually being implemented, not preemptively.
 ```text
 Phase 1 — Foundation & AppSync/GraphQL Incident Integration — ✅ Complete
 Phase 2 — Cognito Authentication — ✅ Complete
-Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management — 🔶 Local implementation done, AWS Console + migration pending — ⬅ next up
+Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management — 🔶 Onboarding + logo storage implemented locally; AWS Console + migration pending; incident-tenancy resolvers + migration script still need to be (re)written — ⬅ next up
 Phase 2.5 — Incident Update/Delete (once AppSync exposes updateIncident/deleteIncident)
 Phase 3 — S3 Attachments
 Phase 4 — Bedrock AI Analysis (summarization, risk scoring)
@@ -816,6 +1321,19 @@ shipped as one unit and are now folded into Phase 1.)
   field exist yet), and no incident data has been migrated. See
   [Multi-Tenancy](#multi-tenancy-phase-22) for the exact AWS Console
   steps and migration required.
+- **Incident-tenancy resolver files and the migration script are
+  missing, despite being referenced throughout this document.**
+  `infrastructure/appsync/resolvers/Query.myOrganization.js`,
+  `Query.incidents.js`, `Query.incident.js`, `Mutation.createIncident.js`,
+  and `scripts/migrate-incidents-to-organizations.mjs` do not currently
+  exist in the repo (discovered while implementing Organization
+  Onboarding — the directories that should hold them were empty). Only
+  `resolveCallerOrganization.function.js`,
+  `Mutation.createOrganization.js`, and `schema-organizations.graphql`
+  exist right now. These missing files need to be (re)written before
+  Phase 2.2 can be completed end-to-end — treat every reference to them
+  elsewhere in this README as a description of required work, not
+  confirmation they exist.
 - **No update/delete:** the deployed AppSync API only exposes
   `createIncident`, `incident`, and `incidents` — there was never an
   edit/delete UI to migrate, and none has been invented. Planned for
@@ -824,14 +1342,21 @@ shipped as one unit and are now folded into Phase 1.)
   architecture — see [Authentication](#authentication) for why
   Middleware doesn't fit here yet, and what would need to change for
   server-side enforcement.
-- **Dashboard not migrated:** `/dashboard` still renders hardcoded
-  stat cards (`0` for every metric) — it was out of scope for the
-  Incident-functionality migration and is planned for Phase 7.
+- **Dashboard stats are still hardcoded:** `/dashboard` is now the
+  authenticated app's entry point and shows the real organization
+  name/logo/role, but its four stat cards still render `0` for every
+  metric — wiring them to real `src/lib/incidents.js` data is planned
+  for Phase 7, unrelated to it becoming the entry point.
 - **Empty scaffolding:** `src/components/{incidents,layout,ui}/`,
   `src/config/`, and `src/lib/utils/` exist but contain no files yet.
 - **No tests, no CI/CD:** deliberate for this project at this stage —
   no test framework or pipeline is configured, and none is currently
   planned.
+- **Signup depends on unverified Cognito Console settings:** self-
+  registration and email-verification-on-signup must be enabled on the
+  User Pool for `/signup` to work; this hasn't been confirmed live (the
+  local IAM user can't read User Pool config) — see
+  [Signup & Email Verification](#signup--email-verification).
 - **`.gitignore` entries for `AGENTS.md`/`CLAUDE.md` are now
   effective:** both files were untracked from git (`git rm --cached`)
   during Phase 1, so the existing `.gitignore` rule for them now
@@ -848,6 +1373,20 @@ shipped as one unit and are now folded into Phase 1.)
 - **S3 attachments:** will require careful IAM scoping (pre-signed URLs,
   not direct client credentials) and virus/type validation before
   incidents can carry uploads.
+- **Organization logo objects are never moved out of `temporary/`:**
+  see [Organization Onboarding](#organization-onboarding) — this is a
+  deliberate simplification (no Lambda available to perform a real S3
+  move), not a bug, but it means the `temporary/` prefix is misleading
+  once an org exists. If a "move to a clean permanent key" feature is
+  ever built, it needs a Lambda function, and `logoKey` would need to
+  be updated after the move.
+- **Organization logo IAM policy depends on Cognito Identity Pool ABAC
+  (principal tags) being configured correctly** — a less common Console
+  setting than the simpler `${cognito-identity.amazonaws.com:sub}`
+  pattern. If it's misconfigured, uploads will fail with an
+  access-denied error from S3 (not a RiskLens-specific error message) —
+  double-check the ABAC custom mapping first if logo upload doesn't
+  work after the Console steps.
 - **Bedrock/RAG:** must not be called directly from the browser; route
   through Lambda/AppSync resolvers to avoid exposing model access or
   prompts to the client. Cost/latency of Bedrock calls should be
@@ -883,8 +1422,8 @@ shipped as one unit and are now folded into Phase 1.)
 | Architecture | **Needs Work** | Incident read/create flow and Cognito authentication both correctly go through AppSync/GraphQL; Lambda/Bedrock/S3 layers not started |
 | Security | **Needs Work** | Cognito login/logout/session work and AppSync enforces Cognito User Pool authorization for the currently-live schema; tenant isolation is designed (Phase 2.2) but not yet deployed; still no MFA, no server-side (cookie/Middleware) route protection, no RBAC |
 | Repository structure | **Ready** | `src/graphql/` + `src/lib/{incidents,organization}.js` service-layer pattern is in place and matches the target structure; `infrastructure/appsync/` now holds the AppSync schema/resolver source-of-truth this project previously lacked |
-| Environment configuration | **Needs Work** | `.env` correctly gitignored; env vars validated with clear errors; no `.env.example` yet for onboarding; no new env vars needed for Phase 2.2 |
-| AWS integration readiness | **Needs Work** | AppSync/DynamoDB/Cognito integration for Incidents and authentication is working end-to-end on the currently-deployed schema; Phase 2.2's schema/resolver/GSI2 changes are written but not deployed; Lambda/Bedrock/S3 not yet integrated |
+| Environment configuration | **Needs Work** | `.env` correctly gitignored; env vars validated with clear errors; no `.env.example` yet; Organization Onboarding needs `NEXT_PUBLIC_S3_BUCKET_NAME`/`NEXT_PUBLIC_S3_REGION` added (`NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` key already present) |
+| AWS integration readiness | **Needs Work** | AppSync/DynamoDB/Cognito integration for Incidents and authentication is working end-to-end on the currently-deployed schema; Phase 2.2's schema/resolver/GSI2/S3 changes are written but not deployed; incident-tenancy resolvers + migration script still need to be (re)written; Lambda/Bedrock not yet integrated |
 | Testing readiness | **Future** | No test framework configured — deliberate choice for this project; Phase 2.2 verification is a manual checklist (see Multi-Tenancy) instead |
 | Scalability | **Needs Work** | Phase 2.2's tenant-scoped `incidents()` query (direct `ORG#<id>` partition query) fixes the old single shared `GSI1` "INCIDENTS" bucket pattern once deployed — not yet live |
 | Maintainability | **Ready** | Clean UI → service layer → GraphQL client → AppSync separation; no GraphQL queries embedded in UI components |
