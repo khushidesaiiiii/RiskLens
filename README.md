@@ -37,9 +37,11 @@ Phase 2 — Cognito Authentication
 Status: Complete
 
 Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management
-Status: Local implementation done — AWS Console changes + data
-        migration required before this phase is live (see
-        Multi-Tenancy below)
+Status: In progress — organization schema (myOrganization,
+        createOrganization) and organization logo storage (S3 +
+        Cognito Identity Pool) are configured in AWS; updateOrganization
+        is not in the deployed schema yet, and incident data migration
+        is still pending (see Multi-Tenancy below)
 
 Signup & Email Verification
 Status: Implemented locally — Cognito signup/verification is a separate
@@ -694,8 +696,16 @@ GraphQL argument shapes for `incidents`/`incident`/`createIncident` are
 
 ### AWS Console steps required
 
-**Nothing above is live yet.** These are the exact manual steps —
-none of them can be performed from this repository.
+**Current state (2026-09-23):** the deployed AppSync schema now has
+`Organization`, `OrganizationMembership`, `MyOrganizationMembership`,
+`CreateOrganizationInput`, `Query.myOrganization`, and
+`Mutation.createOrganization` (and `Incident` now includes
+`organizationId: ID!`), and step 6 (S3 + Identity Pool for logos) is
+configured. `UpdateOrganizationInput`/`Mutation.updateOrganization` are
+**not** in the deployed schema yet — saving on `/organization` will
+fail until they're added (see
+[Organization Details](#organization-details-editing)). These are the
+manual steps — none of them can be performed from this repository.
 
 1. **DynamoDB → add GSI2** (RiskLens table → Indexes → Create index)
    - Partition key: `GSI2PK` (String)
@@ -771,9 +781,13 @@ none of them can be performed from this repository.
    - **Verify:** see [Organization Onboarding](#organization-onboarding)
      below for the full checklist.
 
-6. **S3 + Cognito Identity Pool for logo uploads** (new — see
-   [Organization Onboarding](#organization-onboarding) for the full
-   design/rationale):
+6. **S3 + Cognito Identity Pool for logo uploads** — ✅ **configured**
+   (2026-09-23). The Identity Pool's authenticated role is
+   **`RiskLens_Auth_Role`**, and the bucket name/region are set in
+   `.env` (see [Environment Variables](#environment-variables)). The
+   steps below are kept as the record of what that setup must contain —
+   see [Organization Onboarding](#organization-onboarding) for the full
+   design/rationale:
    1. Create a **private** S3 bucket (block all public access —
       no public-read, no public-write). Note its name and region.
    2. Create a **Cognito Identity Pool**, with your existing Cognito
@@ -784,8 +798,9 @@ none of them can be performed from this repository.
       resolver agree on the same identifier — see
       [Organization Onboarding](#organization-onboarding) for why this
       matters.
-   3. On the Identity Pool's **authenticated** IAM role, attach a
-      policy scoped to the caller's own tag-derived prefix only:
+   3. On the Identity Pool's **authenticated** IAM role
+      (`RiskLens_Auth_Role`), attach a policy scoped to the caller's own
+      tag-derived prefix only:
       ```json
       {
         "Version": "2012-10-17",
@@ -798,10 +813,10 @@ none of them can be performed from this repository.
         ]
       }
       ```
-   4. Add `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` (already present as a
-      key in `.env` — confirm it has the real Identity Pool ID),
-      `NEXT_PUBLIC_S3_BUCKET_NAME`, and `NEXT_PUBLIC_S3_REGION` to
-      `.env` — see [Environment Variables](#environment-variables).
+   4. Set `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID`,
+      `NEXT_PUBLIC_S3_BUCKET_NAME`, and `NEXT_PUBLIC_S3_REGION` in
+      `.env` (done — all three are present) — see
+      [Environment Variables](#environment-variables).
    - **Why an Identity Pool at all, when AppSync itself authorizes via
      the User Pool directly?** S3 has no equivalent of "Cognito User
      Pool authorization" the way AppSync does — browser-to-S3 uploads
@@ -891,10 +906,38 @@ deliberate: it means the S3-side access boundary and the
 `Mutation.createOrganization.js` validation boundary are enforced
 against the exact same identifier, not two identity systems that
 merely happen to look similar. See AWS Console step 6 above for the
-exact IAM policy and Identity Pool configuration this assumes — **none
-of it exists yet**, so logo upload will fail with a clear "not
-configured yet" error (`src/lib/storage.js`) until it's set up; the
-rest of onboarding (all the required text fields) works without it.
+exact IAM policy and Identity Pool configuration this assumes — **it is
+configured** (bucket, Identity Pool, and `RiskLens_Auth_Role`), so logo
+upload is live. If those env vars are ever removed, `src/lib/storage.js`
+falls back to a clear "not configured yet" error and the rest of
+onboarding (all the required text fields) still works without a logo.
+
+**Upload path (as configured):**
+
+```text
+OrganizationOnboardingForm / OrganizationDetailsForm
+        ↓
+uploadOrganizationLogo()          (src/lib/storage.js)
+        ↓
+Amplify Storage                   (aws-amplify/storage — uploadData)
+        ↓
+Cognito Identity Pool             (NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID —
+        ↓                          short-lived STS credentials from the
+        ↓                          User Pool session)
+RiskLens_Auth_Role                (authenticated role — S3 access scoped
+        ↓                          to the caller's own prefix)
+S3                                (NEXT_PUBLIC_S3_BUCKET_NAME /
+        ↓                          NEXT_PUBLIC_S3_REGION, private bucket)
+        ↓
+temporary/organizations/<cognito-sub>/<uuid>/<filename>
+```
+
+The resulting key is then passed as `logoKey` to
+`createOrganization`/`updateOrganization` — only the key string goes
+through AppSync/DynamoDB, never the image bytes. Displaying a logo goes
+the other way: `OrganizationLogo` → `getOrganizationLogoUrl()` →
+Amplify Storage `getUrl()` (a short-lived signed URL via the same
+Identity Pool credentials).
 
 **Flow:**
 1. `resolveCallerOrganization` (pipeline step 1) looks up an existing
@@ -1148,26 +1191,28 @@ NEXT_PUBLIC_COGNITO_USER_POOL_ID=your-user-pool-id
 NEXT_PUBLIC_COGNITO_CLIENT_ID=your-client-id
 NEXT_PUBLIC_COGNITO_REGION=your-region
 
-# Organization logo uploads (Organization Onboarding) — optional; the
-# app works without these, just without logo upload. See
-# Multi-Tenancy -> AWS Console step 6.
+# Organization logo uploads (Organization Onboarding/Details) — set in
+# this project's .env. The app still works without these, just without
+# logo upload. See Multi-Tenancy -> AWS Console step 6.
 NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID=your-identity-pool-id
 NEXT_PUBLIC_S3_BUCKET_NAME=your-s3-bucket-name
 NEXT_PUBLIC_S3_REGION=your-s3-bucket-region
 ```
 
 - Values above are **placeholders only** — never commit real values.
-- `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` is already present as a key in
-  this project's `.env` (added ahead of this task); confirm it holds a
-  real Identity Pool ID before testing logo upload.
-  `NEXT_PUBLIC_S3_BUCKET_NAME`/`NEXT_PUBLIC_S3_REGION` are not yet
-  present and need to be added once the S3 bucket exists (Multi-Tenancy
-  → AWS Console step 6). `src/lib/amplify.js` only configures Amplify
+- `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID`, `NEXT_PUBLIC_S3_BUCKET_NAME`,
+  and `NEXT_PUBLIC_S3_REGION` are all set in this project's `.env`, so
+  logo upload is enabled. `src/lib/amplify.js` only configures Amplify
   `Storage` when all three are present — login/AppSync are completely
   unaffected if they're missing, and `src/lib/storage.js` throws a
   clear, catchable "not configured yet" error if a logo upload is
   attempted without them (the rest of onboarding still works — logo is
   optional).
+- `.env` also contains unprefixed duplicates — `COGNITO_IDENTITY_POOL_ID`,
+  `S3_BUCKET_NAME`, `S3_REGION` — that **no application code reads**
+  (only the `NEXT_PUBLIC_*` versions are used, and only those reach the
+  browser). They're harmless but can be removed to avoid confusion
+  about which one is authoritative.
 - `.gitignore` ignores `.env*`, which covers `.env`, `.env.local`, and
   `.env.*.local`.
 - Missing any of the Cognito variables produces a clear thrown error
@@ -1296,7 +1341,7 @@ needs it is actually being implemented, not preemptively.
 ```text
 Phase 1 — Foundation & AppSync/GraphQL Incident Integration — ✅ Complete
 Phase 2 — Cognito Authentication — ✅ Complete
-Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management — 🔶 Onboarding + logo storage implemented locally; AWS Console + migration pending; incident-tenancy resolvers + migration script still need to be (re)written — ⬅ next up
+Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management — 🔶 Organization schema + logo storage (S3/Identity Pool) configured in AWS; updateOrganization + migration pending; incident-tenancy resolvers + migration script still need to be (re)written — ⬅ next up
 Phase 2.5 — Incident Update/Delete (once AppSync exposes updateIncident/deleteIncident)
 Phase 3 — S3 Attachments
 Phase 4 — Bedrock AI Analysis (summarization, risk scoring)
@@ -1422,8 +1467,8 @@ shipped as one unit and are now folded into Phase 1.)
 | Architecture | **Needs Work** | Incident read/create flow and Cognito authentication both correctly go through AppSync/GraphQL; Lambda/Bedrock/S3 layers not started |
 | Security | **Needs Work** | Cognito login/logout/session work and AppSync enforces Cognito User Pool authorization for the currently-live schema; tenant isolation is designed (Phase 2.2) but not yet deployed; still no MFA, no server-side (cookie/Middleware) route protection, no RBAC |
 | Repository structure | **Ready** | `src/graphql/` + `src/lib/{incidents,organization}.js` service-layer pattern is in place and matches the target structure; `infrastructure/appsync/` now holds the AppSync schema/resolver source-of-truth this project previously lacked |
-| Environment configuration | **Needs Work** | `.env` correctly gitignored; env vars validated with clear errors; no `.env.example` yet; Organization Onboarding needs `NEXT_PUBLIC_S3_BUCKET_NAME`/`NEXT_PUBLIC_S3_REGION` added (`NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` key already present) |
-| AWS integration readiness | **Needs Work** | AppSync/DynamoDB/Cognito integration for Incidents and authentication is working end-to-end on the currently-deployed schema; Phase 2.2's schema/resolver/GSI2/S3 changes are written but not deployed; incident-tenancy resolvers + migration script still need to be (re)written; Lambda/Bedrock not yet integrated |
+| Environment configuration | **Needs Work** | `.env` correctly gitignored; env vars validated with clear errors; no `.env.example` yet; logo-upload vars (`NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID`, `NEXT_PUBLIC_S3_BUCKET_NAME`, `NEXT_PUBLIC_S3_REGION`) are set; unused unprefixed duplicates can be cleaned up |
+| AWS integration readiness | **Needs Work** | AppSync/DynamoDB/Cognito integration for Incidents and authentication is working end-to-end on the currently-deployed schema; Phase 2.2's organization schema and S3/Identity Pool logo storage are deployed, `updateOrganization` and the incident migration are not yet; incident-tenancy resolvers + migration script still need to be (re)written; Lambda/Bedrock not yet integrated |
 | Testing readiness | **Future** | No test framework configured — deliberate choice for this project; Phase 2.2 verification is a manual checklist (see Multi-Tenancy) instead |
 | Scalability | **Needs Work** | Phase 2.2's tenant-scoped `incidents()` query (direct `ORG#<id>` partition query) fixes the old single shared `GSI1` "INCIDENTS" bucket pattern once deployed — not yet live |
 | Maintainability | **Ready** | Clean UI → service layer → GraphQL client → AppSync separation; no GraphQL queries embedded in UI components |

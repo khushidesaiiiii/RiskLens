@@ -50,6 +50,31 @@ export default function OrganizationDetailsForm({ organization, onUpdated }) {
         setIsEditing(true);
     }
 
+    async function handleCancelClick() {
+        const unsavedUploadKey = logoFile ? logoKey : null;
+
+        setFields({
+            name: organization.name,
+            email: organization.email,
+            address: organization.address,
+            street: organization.street,
+            state: organization.state,
+            country: organization.country,
+        });
+        setLogoKey(organization.logoKey || null);
+        setLogoFile(null);
+        setLogoPreviewUrl(null);
+        setLogoError(null);
+        setSaveError(null);
+        setIsEditing(false);
+
+        // Same rule as handleRemoveLogo: only discard an upload made during
+        // this edit session, never the organization's saved logo.
+        if (unsavedUploadKey && unsavedUploadKey !== organization.logoKey) {
+            await deleteUploadedLogo(unsavedUploadKey);
+        }
+    }
+
     async function handleLogoChange(event) {
         const file = event.target.files?.[0];
         event.target.value = "";
@@ -356,16 +381,34 @@ export default function OrganizationDetailsForm({ organization, onUpdated }) {
                     </div>
                 </div>
 
+                {/*
+                  Distinct keys are required: without them React reuses the
+                  same <button> DOM node and just flips type="button" to
+                  type="submit" mid-click, so clicking "Edit" immediately
+                  submits the form.
+                */}
                 {isEditing ? (
-                    <button
-                        type="submit"
-                        disabled={submitDisabled}
-                        className="w-full rounded-lg bg-black px-4 py-2 text-sm font-medium text-white hover:bg-gray-800 disabled:opacity-50"
-                    >
-                        {isSaving ? "Saving..." : "Save Changes"}
-                    </button>
+                    <div key="editing-actions" className="flex gap-3">
+                        <button
+                            type="button"
+                            onClick={handleCancelClick}
+                            disabled={isSaving}
+                            className="w-full rounded-lg border px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                        >
+                            Cancel
+                        </button>
+
+                        <button
+                            type="submit"
+                            disabled={submitDisabled}
+                            className="w-full rounded-lg bg-black px-4 py-2 text-sm font-medium text-white hover:bg-gray-800 disabled:opacity-50"
+                        >
+                            {isSaving ? "Saving..." : "Save Changes"}
+                        </button>
+                    </div>
                 ) : (
                     <button
+                        key="edit-button"
                         type="button"
                         onClick={handleEditClick}
                         className="w-full rounded-lg border px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"

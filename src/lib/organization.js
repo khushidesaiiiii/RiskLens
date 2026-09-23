@@ -50,7 +50,7 @@ export async function updateOrganization({
             street,
             state,
             country,
-            ...(logoKey ? { logoKey } : {}),
+            ...(logoKey !== undefined ? { logoKey } : {}),
         },
     });
 
