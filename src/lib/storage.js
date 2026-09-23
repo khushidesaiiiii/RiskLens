@@ -78,13 +78,25 @@ export async function uploadOrganizationLogo(file) {
  */
 export async function deleteUploadedLogo(logoKey) {
     if (!logoKey || !isStorageConfigured()) {
-        return;
+        return false;
     }
 
     try {
-        await remove({ path: logoKey });
+        await remove({
+            path: logoKey,
+        });
+
+        return true;
     } catch (error) {
-        console.error("Failed to clean up uploaded logo:", error);
+        console.error("Failed to clean up uploaded logo:", {
+            logoKey,
+            name: error?.name,
+            message: error?.message,
+            code: error?.code,
+            error,
+        });
+
+        return false;
     }
 }
 
