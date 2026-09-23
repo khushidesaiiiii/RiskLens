@@ -3,6 +3,12 @@ export const CREATE_ORGANIZATION = `
     createOrganization(input: $input) {
       id
       name
+      email
+      address
+      street
+      state
+      country
+      logoKey
       createdAt
       updatedAt
     }
