@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 
 import { getIncident } from "@/lib/incidents";
+import IncidentEditForm from "@/components/incidents/IncidentEditForm";
 
 export default function IncidentDetailPage() {
     const { id } = useParams();
@@ -12,6 +13,19 @@ export default function IncidentDetailPage() {
     const [incident, setIncident] = useState(null);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [isEditing, setIsEditing] = useState(false);
+    const [saveSuccess, setSaveSuccess] = useState(false);
+
+    function handleEditClick() {
+        setSaveSuccess(false);
+        setIsEditing(true);
+    }
+
+    function handleSaved(updatedIncident) {
+        setIncident(updatedIncident);
+        setIsEditing(false);
+        setSaveSuccess(true);
+    }
 
     useEffect(() => {
         if (!id) return;
@@ -80,16 +94,40 @@ export default function IncidentDetailPage() {
                     </div>
                 )}
 
-                {!isLoading && !error && incident && (
+                {!isLoading && !error && incident && isEditing && (
+                    <IncidentEditForm
+                        incident={incident}
+                        onSaved={handleSaved}
+                        onCancel={() => setIsEditing(false)}
+                    />
+                )}
+
+                {!isLoading && !error && incident && !isEditing && saveSuccess && (
+                    <div className="mt-6 rounded-lg border border-green-300 bg-green-50 p-4 text-sm text-green-700">
+                        Incident updated.
+                    </div>
+                )}
+
+                {!isLoading && !error && incident && !isEditing && (
                     <div className="mt-6 rounded-xl border bg-white p-8 shadow-sm">
                         <div className="flex items-center justify-between gap-4">
                             <h1 className="text-2xl font-bold text-gray-900">
                                 {incident.title}
                             </h1>
 
-                            <span className="shrink-0 rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-700">
-                                {incident.severity}
-                            </span>
+                            <div className="flex shrink-0 items-center gap-3">
+                                <span className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-700">
+                                    {incident.severity}
+                                </span>
+
+                                <button
+                                    type="button"
+                                    onClick={handleEditClick}
+                                    className="rounded-lg border px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                                >
+                                    Edit
+                                </button>
+                            </div>
                         </div>
 
                         <p className="mt-4 whitespace-pre-wrap text-gray-700">

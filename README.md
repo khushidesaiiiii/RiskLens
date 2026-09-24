@@ -1342,7 +1342,7 @@ needs it is actually being implemented, not preemptively.
 Phase 1 — Foundation & AppSync/GraphQL Incident Integration — ✅ Complete
 Phase 2 — Cognito Authentication — ✅ Complete
 Phase 2.2 — Multi-Tenancy + Organization-aware Incident Management — 🔶 Organization schema + logo storage (S3/Identity Pool) configured in AWS; updateOrganization + migration pending; incident-tenancy resolvers + migration script still need to be (re)written — ⬅ next up
-Phase 2.5 — Incident Update/Delete (once AppSync exposes updateIncident/deleteIncident)
+Phase 2.5 — Incident Update/Delete — 🔶 updateIncident deployed + wired to /incidents/[id]; Close Incident + delete pending
 Phase 3 — S3 Attachments
 Phase 4 — Bedrock AI Analysis (summarization, risk scoring)
 Phase 5 — RAG / Knowledge Base (policies, procedures, historical incidents)
@@ -1379,10 +1379,15 @@ shipped as one unit and are now folded into Phase 1.)
   Phase 2.2 can be completed end-to-end — treat every reference to them
   elsewhere in this README as a description of required work, not
   confirmation they exist.
-- **No update/delete:** the deployed AppSync API only exposes
-  `createIncident`, `incident`, and `incidents` — there was never an
-  edit/delete UI to migrate, and none has been invented. Planned for
-  Phase 2.5 once the corresponding AppSync resolvers exist.
+- **Incident update is wired; close/delete are not.** `updateIncident(id,
+  input: UpdateIncidentInput)` was deployed directly in AppSync Console
+  (pipeline: `resolveCallerOrganization` → `updateIncident` →
+  `getUpdatedIncident`, scoped via `ctx.stash.organizationId`) — its
+  resolver code is **not** in this repo. The frontend calls it from
+  `/incidents/[id]` (Edit → `src/components/incidents/IncidentEditForm.js`
+  → `src/lib/incidents.js`'s `updateIncident()`), sending only changed
+  `title`/`description`/`location`/`severity` — never `organizationId`
+  or `status`. Close Incident (status change) and delete are not built.
 - **Route protection is client-side only**, by design for this
   architecture — see [Authentication](#authentication) for why
   Middleware doesn't fit here yet, and what would need to change for
